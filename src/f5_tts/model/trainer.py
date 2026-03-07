@@ -215,9 +215,9 @@ class Trainer:
                     checkpoints = [
                         f
                         for f in os.listdir(self.checkpoint_path)
-                        if f.startwith("model_")
-                        and not f.startwith("pretrained_") # Exclude pretrained models
-                        and f.endwith(".pt")
+                        if f.startswith("model_")
+                        and not f.startswith("pretrained_") # Exclude pretrained models
+                        and f.endswith(".pt")
                         and f != "model_last.pt"
                     ]
                     checkpoints.sort(key=lambda x : int(x.split("_")[1].split(".")[0]))
