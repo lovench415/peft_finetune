@@ -178,7 +178,7 @@ def prepare_and_save_set(inp_dir, out_dir, lst_dir, tokenizer_path, is_finetune=
     train_samples, train_durations = zip(*train_pairs)
 
     save_test_lst(lst_dir, test_samples)
-    save_prepped_dataset(out_dir, train_samples, train_durations, vocab_set, is_finetune, add_vocab)
+    save_prepped_dataset(out_dir, train_samples, train_durations, vocab_set, is_finetune, add_vocab, tokenizer_path)
 
 def cli():
     input_path = "/workspace/PEFT-TTS/KSS"
