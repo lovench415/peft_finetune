@@ -3,7 +3,7 @@ import os
 import shutil
 
 import sys
-sys.path.insert(0, "/workspace/PEFT-TTS/src")
+#sys.path.insert(0, "/workspace/PEFT-TTS/src")
 
 
 from cached_path import cached_path
