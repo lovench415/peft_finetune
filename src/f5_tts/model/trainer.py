@@ -196,7 +196,7 @@ class Trainer:
         if self.is_main:
             checkpoint = dict(
                 model_state_dict=self.accelerator.unwrap_model(self.model).state_dict(),
-                optimizer_state_dict=self.accelerator.unwrap_model(self.optimizer).state_dict(),
+                optimizer_state_dict=self.optimizer.state_dict(),
                 ema_model_state_dict=self.ema_model.state_dict(),
                 scheduler_state_dict=self.scheduler.state_dict(),
                 update=update,
@@ -368,7 +368,7 @@ class Trainer:
                 self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)  
             else:
                 self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
-                self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint["optimizer_state_dict"])
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
             #self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint["optimizer_state_dict"])
             if self.scheduler:
