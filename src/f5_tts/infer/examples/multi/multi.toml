@@ -1,0 +1,11 @@
+# F5TTS_v1_Base | E2TTS_Base
+model = "PEFT-TTS_base"
+ref_audio = "infer/examples/multi/multi_ref_kr.wav"
+# If an empty "", transcribes the reference audio automatically.
+ref_text = "아버지는 아끼는 도자기를 입찰에 붙이려고 경매시장에 내놓았다."
+gen_text = "사람은 겉과 속이 달라서는 안된다."
+# File with text to generate. Ignores the text above.
+gen_file = ""
+remove_silence = false
+output_dir = "tests"
+output_file = "infer_cli_multi.wav"
