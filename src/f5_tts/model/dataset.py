@@ -292,7 +292,7 @@ def load_dataset(
 
 
     if dataset_type == "CustomDataset":
-        rel_data_path = f"/workspace/PEFT-TTS/data/{dataset_name}_{tokenizer}"
+        rel_data_path = f"data/{dataset_name}_{tokenizer}"
         #rel_data_path = str(files("f5_tts").joinpath(f"../../"))
         #rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{tokenizer}"))            
         print(f"rel_data_path : {rel_data_path}")
