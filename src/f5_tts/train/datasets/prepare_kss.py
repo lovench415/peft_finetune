@@ -163,7 +163,7 @@ def save_test_lst(lst_dir, result):
     print(f"\nFor KSS, test sample count : {len(result)}, {len(result)/2} rows")
 
 
-def prepare_and_save_set(inp_dir, out_dir, lst_dir, is_finetune=True, add_vocab = True, test_count = 200, tokenizer_path):
+def prepare_and_save_set(inp_dir, out_dir, lst_dir, tokenizer_path, is_finetune=True, add_vocab = True, test_count = 200):
     if is_finetune:
         assert tokenizer_path.exists(), f"Pretrained vocab.txt not found: {tokenizer_path}"
     sub_result, durations, vocab_set = prepare_csv_wavs_dir(inp_dir)
