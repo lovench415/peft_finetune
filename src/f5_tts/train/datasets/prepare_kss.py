@@ -18,7 +18,7 @@ from f5_tts.model.utils import convert_char_to_pinyin_orig
 
 # Korean Single Speaker (KSS Dataset)
 # download from : https://www.kaggle.com/datasets/bryanpark/korean-single-speaker-speech-dataset
-PRETRAINED_VOCAB_PATH = Path("/workspace/PEFT-TTS/data/Emilia_ZH_EN_pinyin/vocab.txt")
+PRETRAINED_VOCAB_PATH = Path("/kaggle/working/peft_finetune/vocab.txt")
 NEW_VOCAB_PATH = Path("/workspace/PEFT-TTS/data/vocab_ko.txt")
 
 
@@ -99,7 +99,7 @@ def read_audio_text_pairs(csv_file_path):
                 audio_text_pairs.append((audio_file_path.as_posix(), text))
     return audio_text_pairs
 
-def save_prepped_dataset(out_dir, result, duration_list, text_vocab_set, is_finetune, add_vocab, tokenizer_path):
+def save_prepped_dataset(out_dir, result, duration_list, text_vocab_set, is_finetune, add_vocab):
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
     print(f"\nSaving to {out_dir} ...")
@@ -115,7 +115,7 @@ def save_prepped_dataset(out_dir, result, duration_list, text_vocab_set, is_fine
 
     voca_out_path = out_dir / "vocab.txt"
     if is_finetune:
-        file_vocab_finetune = tokenizer_path.as_posix()
+        file_vocab_finetune = PRETRAINED_VOCAB_PATH.as_posix()
         shutil.copy2(file_vocab_finetune, voca_out_path)
         if add_vocab:
             # TODO : compare pretrained vocab.txt and text_vocab_set
@@ -163,9 +163,9 @@ def save_test_lst(lst_dir, result):
     print(f"\nFor KSS, test sample count : {len(result)}, {len(result)/2} rows")
 
 
-def prepare_and_save_set(inp_dir, out_dir, lst_dir, tokenizer_path, is_finetune=True, add_vocab = True, test_count = 200):
+def prepare_and_save_set(inp_dir, out_dir, lst_dir, is_finetune=True, add_vocab = True, test_count = 200):
     if is_finetune:
-        assert tokenizer_path.exists(), f"Pretrained vocab.txt not found: {tokenizer_path}"
+        assert PRETRAINED_VOCAB_PATH.exists(), f"Pretrained vocab.txt not found: {PRETRAINED_VOCAB_PATH}"
     sub_result, durations, vocab_set = prepare_csv_wavs_dir(inp_dir)
 
     paired_data = list(zip(sub_result, durations))
@@ -178,7 +178,7 @@ def prepare_and_save_set(inp_dir, out_dir, lst_dir, tokenizer_path, is_finetune=
     train_samples, train_durations = zip(*train_pairs)
 
     save_test_lst(lst_dir, test_samples)
-    save_prepped_dataset(out_dir, train_samples, train_durations, vocab_set, is_finetune, add_vocab, tokenizer_path)
+    save_prepped_dataset(out_dir, train_samples, train_durations, vocab_set, is_finetune, add_vocab)
 
 def cli():
     input_path = "/workspace/PEFT-TTS/KSS"
@@ -194,15 +194,8 @@ def cli():
     parser.add_argument("--pretrain", action="store_true", help="Enable for new pretrain, otherwise is a fine-tune")
     parser.add_argument("--add_vocab", type=bool, default =None, help= "Add new vocabs of your own datasets not found in pre-trained vocab.txt.")
     parser.add_argument("--test_count", type=int, default= 200, help= "Amount of samples you want to split for you test set")
-    parser.add_argument(
-        "--tokenizer_path",
-        type=str,
-        default=None,
-        help="Path to custom tokenizer vocab file (only used if tokenizer = 'custom')",
-    )
-
     args = parser.parse_args()
-    prepare_and_save_set(inp_dir = args.inp_dir, out_dir = args.out_dir, lst_dir = args.lst_dir, is_finetune = not args.pretrain, add_vocab = args.add_vocab, test_count = args.test_count, tokenizer_path = args.tokenizer_path)
+    prepare_and_save_set(inp_dir = args.inp_dir, out_dir = args.out_dir, lst_dir = args.lst_dir, is_finetune = not args.pretrain, add_vocab = args.add_vocab, test_count = args.test_count)
 
 if __name__ == "__main__":
 
