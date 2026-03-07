@@ -133,10 +133,13 @@ class TextEmbedding(nn.Module):
             text = torch.zeros_like(text)
 
 
-        zh_en = self.text_embed(text)
-        ko = self.text_embed_ko(text)
-
-        text = (1- self.alpha) * zh_en + self.alpha * ko
+        if self.alpha == 0:
+            text = self.text_embed(text)         # только zh/en
+        elif self.alpha == 1:
+            text = self.text_embed_ko(text)      # только ko
+        else:
+            text = (1 - self.alpha) * self.text_embed(text) + self.alpha * self.text_embed_ko(text)
+        
 
         
 
