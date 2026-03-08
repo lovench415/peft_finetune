@@ -280,21 +280,22 @@ def load_dataset(
     dataset_type: str = "CustomDataset",
     audio_type: str = "raw",
     mel_spec_module: nn.Module | None = None,
-    mel_spec_kwargs: dict = dict(),
+    mel_spec_kwargs: dict = None,
 ) -> CustomDataset | HFDataset:
     """
     dataset_type    - "CustomDataset" if you want to use tokenizer name and default data path to load for train_dataset
                     - "CustomDatasetPath" if you just want to pass the full path to a preprocessed dataset without relying on tokenizer
     """
+    if mel_spec_kwargs is None:
+        mel_spec_kwargs = {}
 
 
     print("Loading dataset ...")
 
 
     if dataset_type == "CustomDataset":
-        rel_data_path = f"data/{dataset_name}"
-        #rel_data_path = str(files("f5_tts").joinpath(f"../../"))
-        #rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{tokenizer}"))            
+        # BUG-25 FIX: include tokenizer suffix in path (e.g. data/KSS_pinyin)
+        rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{tokenizer}"))
         print(f"rel_data_path : {rel_data_path}")
         #exit()
         if audio_type == "raw":

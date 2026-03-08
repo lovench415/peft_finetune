@@ -94,11 +94,12 @@ def main():
         model,
         epochs,
         learning_rate,
-        view_traning_procedure = args.view_training_procedure2,
+        adapter_config=None,                                    # BUG-27 FIX: now required param
+        view_training_procedure=args.view_training_procedure2,  # BUG-28 FIX: typo "traning" → "training"
         num_warmup_updates=num_warmup_updates,
         save_per_updates=save_per_updates,
         checkpoint_path=str(files("f5_tts").joinpath(f"../../ckpts/{exp_name}")),
-        batch_size=batch_size_per_gpu,
+        batch_size_per_gpu=batch_size_per_gpu,                  # BUG-29 FIX: was "batch_size="
         batch_size_type=batch_size_type,
         max_samples=max_samples,
         grad_accumulation_steps=grad_accumulation_steps,
@@ -106,7 +107,7 @@ def main():
         wandb_project="CFM-TTS",
         wandb_run_name=exp_name,
         wandb_resume_id=wandb_resume_id,
-        last_per_steps=last_per_steps,
+        last_per_updates=last_per_steps,                        # param name fix
         log_samples=True,
         mel_spec_type=mel_spec_type,
     )

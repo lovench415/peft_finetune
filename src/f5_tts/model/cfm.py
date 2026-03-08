@@ -116,7 +116,6 @@ class CFM(nn.Module):
 
         if isinstance(text, list):
             if exists(self.vocab_char_map):
-                print(f'len(vocab_char_map : {len(self.vocab_char_map)}')
                 text = list_str_to_idx(text, self.vocab_char_map).to(device)
             else:
                 text = list_str_to_tensor(text).to(device)
@@ -161,10 +160,6 @@ class CFM(nn.Module):
             mask = lens_to_mask(duration)
         else:  # save memory and speed up, as single inference need no mask currently
             mask = None
-
-        # test for no ref audio
-        if no_ref_audio:
-            cond = torch.zeros_like(cond)
 
         # neural ode
 

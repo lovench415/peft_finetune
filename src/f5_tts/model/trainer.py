@@ -7,7 +7,6 @@ import sys
 
 import torch
 import torchaudio
-import wandb
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from ema_pytorch import EMA
@@ -48,18 +47,30 @@ class Trainer:
         wandb_resume_id: str = None,
         log_samples: bool = False,
         last_per_updates=None,
-        accelerate_kwargs: dict = dict(),
-        ema_kwargs: dict = dict(),
+        accelerate_kwargs: dict = None,
+        ema_kwargs: dict = None,
         bnb_optimizer: bool = False,
         mel_spec_type: str = "vocos",  # "vocos" | "bigvgan"
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
-        cfg_dict: dict = dict(),  # training config
+        cfg_dict: dict = None,  # training config
     ):
+        # BUG-30 FIX: avoid mutable default arguments
+        if accelerate_kwargs is None:
+            accelerate_kwargs = {}
+        if ema_kwargs is None:
+            ema_kwargs = {}
+        if cfg_dict is None:
+            cfg_dict = {}
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
-        if logger == "wandb" and not wandb.api.api_key:
-            logger = None
+        if logger == "wandb":
+            try:
+                import wandb
+                if not wandb.api.api_key:
+                    logger = None
+            except ImportError:
+                logger = None
         print(f"Using logger: {logger}")
         self.log_samples = log_samples
 
@@ -183,7 +194,9 @@ class Trainer:
             print(f'learning_rate : {learning_rate}')
 
             self.optimizer = AdamW(model.parameters(), lr=learning_rate)
-        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        # BUG-10 FIX: defer prepare to load_checkpoint to avoid double-wrapping
+        # self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self._prepared = False
 
     @property
     def is_main(self):
@@ -191,7 +204,7 @@ class Trainer:
 
 
     def save_checkpoint(self, update, last=False):
-        print("enter save_checkpoint with {step} steps")
+        print(f"enter save_checkpoint at update {update}")
         self.accelerator.wait_for_everyone()
         if self.is_main:
             checkpoint = dict(
@@ -216,7 +229,7 @@ class Trainer:
                         f
                         for f in os.listdir(self.checkpoint_path)
                         if f.startswith("model_")
-                        and not f.startswith("pretrained_") # Exclude pretrained models
+                        and not f.startswith("pretrained_")
                         and f.endswith(".pt")
                         and f != "model_last.pt"
                     ]
@@ -260,6 +273,8 @@ class Trainer:
             or not os.path.exists(self.checkpoint_path)
             or not any(filename.endswith((".pt", ".safetensors")) for filename in os.listdir(self.checkpoint_path))
         ):
+            # BUG-10 FIX: prepare model even when no checkpoint
+            self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
             return 0
         
 
@@ -367,16 +382,13 @@ class Trainer:
                 self.optimizer = AdamW(trainable_params, lr=self.learning_rate)
                 self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)  
             else:
+                self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
                 self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-            #self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint["optimizer_state_dict"])
-            if self.scheduler:
-                print("there's scheduler")
-                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            # Scheduler is created after load_checkpoint, so skip loading here.
+            # Position is restored via scheduler.step() loop after creation.
             update = checkpoint["update"]
-            #step = checkpoint["step"]
-            #print(f"step : {step}")
         # first training procedure
         else:
             print("there's no 'step' in checkpoint") 
@@ -389,19 +401,18 @@ class Trainer:
             self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"],strict=False)
             #update = 0
 
-            if self.adapter_config: # {'text_embed': 'full', 'input_embed': 'adapter', 'transformer_blocks': 'adpater'}
+            if self.adapter_config:
                 self.set_trainable_parameters()
                 if self.is_main:
                     self.ema_model = EMA(self.model, include_online_model=False, **self.ema_kwargs)
                     self.ema_model.to(self.accelerator.device)
 
-
                 trainable_params = [param for param in self.model.parameters() if param.requires_grad]
-
-                
                 self.optimizer = AdamW(trainable_params, lr=self.learning_rate)
+                self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
-
+            else:
+                # BUG-10 FIX: prepare in non-adapter first-training path
                 self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
             #step = 0
@@ -444,7 +455,7 @@ class Trainer:
                 num_workers=num_workers,
                 pin_memory=True,
                 persistent_workers=True,
-                batch_size=self.batch_size,
+                batch_size=self.batch_size_per_gpu,
                 shuffle=True,
                 generator=generator,
             )
@@ -488,30 +499,29 @@ class Trainer:
         warmup_updates = (
             self.num_warmup_updates * self.accelerator.num_processes
         )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
-        # otherwise by default with split_batches=False, warmup steps change with num_processes
-        #total_steps = len(train_dataloader) * self.epochs / self.grad_accumulation_steps
-        #decay_steps = total_steps - warmup_steps
 
         total_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps) * self.epochs
-        decay_updates = total_updates - warmup_updates
-        
+        # BUG-17 FIX: clamp decay_updates to at least 1
+        decay_updates = max(1, total_updates - warmup_updates)
 
+        # Prepare dataloader first (without scheduler)
+        train_dataloader = self.accelerator.prepare(train_dataloader)
 
+        ## LOADING CHECKPOINT -> ADAPTING LORA HERE
+        # This may replace self.optimizer with a new one (for PEFT trainable params only)
+        start_update = self.load_checkpoint()
+
+        # BUG-16 FIX: create scheduler AFTER load_checkpoint, so it binds to the final optimizer
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
-        #constant_scheduler = ConstantLR(self.optimizer, factor=1.0, total_iters=0)
-
         self.scheduler = SequentialLR(
             self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates]
         )
+        self.scheduler = self.accelerator.prepare(self.scheduler)
 
-
-        train_dataloader, self.scheduler = self.accelerator.prepare(
-            train_dataloader, self.scheduler
-        )  # actual steps = 1 gpu steps / gpus
-
-        ## LOADING CHECKPOINT -> ADAPTING LORA HERE
-        start_update = self.load_checkpoint()
+        # Advance scheduler to match resumed position
+        for _ in range(start_update):
+            self.scheduler.step()
 
         global_update = start_update
         print(f'global_step : {global_update}')
@@ -621,43 +631,33 @@ class Trainer:
 
 
                         before_params = {name: param.clone() for name, param in self.model.named_parameters() if param.requires_grad}
-                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                        zhen_embedding = self.model.transformer.text_embed.text_embed.weight[:,:].clone()
-
-                        ko_embedding = self.model.transformer.text_embed.text_embed_ko.weight[:,:].clone()
-
-                        
+                        # BUG-18 FIX: unwrap model for direct attribute access after DDP
+                        _model = self.accelerator.unwrap_model(self.model)
+                        zhen_embedding = _model.transformer.text_embed.text_embed.weight[:,:].clone()
+                        ko_embedding = _model.transformer.text_embed.text_embed_ko.weight[:,:].clone()
 
 
                         # Optimizer Step
                         self.optimizer.step()
                         self.scheduler.step()
-                        #self.scaling_scheduler.step()
                         self.optimizer.zero_grad()
 
                         # Comparing parameters after Optimizer step
-                        # check if parameters are updated or not
-                        
                         for name, param in self.model.named_parameters():
                             if param.requires_grad:
                                 is_updated = not torch.equal(before_params[name], param)
                                 print(f"Parameter {name} updated: {is_updated}")
                         
-                        # Create a mapping of parameter tensors to their names
                         param_to_name = {param: name for name, param in self.model.named_parameters()}
-
-                        # Iterate over optimizer parameter groups and print their information
                         for group in self.optimizer.param_groups:
                             for param in group['params']:
                                 param_name = param_to_name.get(param, "Unnamed Parameter")
                                 print(f"Name: {param_name}, Shape: {param.shape}, Requires Grad: {param.requires_grad}")
 
-                        # check if origianl embedding ahs changed
-                        
-                        zhen_updated_embedding = self.model.transformer.text_embed.text_embed.weight[:,:]
-                        #ko_updated_embedding = self.model.transformer.text_embed.new_vocab_embed.weight[:,:]
-                        ko_updated_embedding = self.model.transformer.text_embed.text_embed_ko.weight[:,:]
-
+                        # check if original embedding has changed
+                        _model = self.accelerator.unwrap_model(self.model)
+                        zhen_updated_embedding = _model.transformer.text_embed.text_embed.weight[:,:]
+                        ko_updated_embedding = _model.transformer.text_embed.text_embed_ko.weight[:,:]
                         
                         if torch.equal(zhen_embedding[:,:], zhen_updated_embedding[:,:]):
                             print(f"No Changed Zh & EN!")
@@ -665,7 +665,7 @@ class Trainer:
                             print(f"changed Zh & EN")
 
                         if torch.equal(ko_embedding[:,:], ko_updated_embedding[:,:]):
-                            print(f"No Chnaged KO!")
+                            print(f"No Changed KO!")
                         else:
                             print(f"changed KO")
 
@@ -731,12 +731,7 @@ class Trainer:
                                 sway_sampling_coef=sway_sampling_coef,
                             )
                             generated = generated.to(torch.float32)
-                        
-                        #gen_audio = vocoder.decode(
-                        #    generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
-                        #)
-                        
-                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0,2,1).to(self.accelerator.device)
+                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
                             ref_mel_spec = batch["mel"][0].unsqueeze(0)
                             if self.vocoder_name == "vocos":
                                 gen_audio = vocoder.decode(gen_mel_spec).cpu()
@@ -744,7 +739,7 @@ class Trainer:
                             elif self.vocoder_name == "bigvgan":
                                 gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
                                 ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
-                            
+
                         torchaudio.save(
                             f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
                         )

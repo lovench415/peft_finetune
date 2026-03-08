@@ -234,7 +234,6 @@ class GRN(nn.Module):
 
 # ConvNeXt-V2 Block https://github.com/facebookresearch/ConvNeXt-V2/blob/main/models/convnextv2.py
 # ref: https://github.com/bfs18/e2_tts/blob/main/rfwave/modules.py#L108
-from sqlite3 import adapters
 from typing import Callable, List, Optional
 import torch
 from torch import Tensor
@@ -289,8 +288,6 @@ class ConvAdapter(nn.Module):
             act_layer = nn.Identity
 
         # self.act = nn.SiLU()
-        print("Entering ConvAdapter")
-        print(f"inplanes : {inplanes}\t width : {width}\t kernel_size : {kernel_size}\tgroups:{groups}")
         # depth-wise conv
         self.conv1 = nn.Conv1d(inplanes, width, kernel_size=kernel_size, stride=stride, groups=groups, padding=padding, dilation=int(dilation))
         # self.norm = norm_layer(width)
@@ -300,9 +297,12 @@ class ConvAdapter(nn.Module):
         self.conv2 = nn.Conv1d(width, outplanes, kernel_size=1, stride=1)
 
         # se 
-        # self.se = SqueezeExcitation(inplanes, width, outplanes, activation=act_layer)
         self.se = nn.Parameter(1.0 * torch.ones((1, outplanes,1)), requires_grad=True) ## alpha (initialized with 1)
-        # self.se = 4.0
+
+        # BUG-22 FIX: zero-init conv2 so adapter output starts at zero (like LoRA)
+        nn.init.zeros_(self.conv2.weight)
+        if self.conv2.bias is not None:
+            nn.init.zeros_(self.conv2.bias)
 
     def forward(self, x):
         out = self.conv1(x)
@@ -352,15 +352,18 @@ class ConvNeXtV2Block(nn.Module):
         self.tuning_config = tuning_config
 
         if self.tuning_config and 'conv_adapt' in self.tuning_config.method:
+            # BUG-3 FIX: multiply by adapt_size to compress (not divide)
+            # adapt_size=0.25 → width = dim * 0.25 = 128 (compression to 25%)
+            adapter_width = max(1, int(dim * self.tuning_config.adapt_size))
             self.conv_adapter = ConvAdapter(
                 dim, dim,
-                kernel_size = int(self.tuning_config.kernel_size),
-                padding= int(dilation * (self.tuning_config.kernel_size - 1) // 2),
-                width= int(dim // self.tuning_config.adapt_size),
-                stride= 1,
-                groups= int(dim // self.tuning_config.adapt_size) if self.tuning_config.adapt_size >=1 else int(dim), # incase 'compression factor' is small than 1 
-                dilation= 1,
-                act_layer= nn.GELU
+                kernel_size=int(self.tuning_config.kernel_size),
+                padding=int(dilation * (self.tuning_config.kernel_size - 1) // 2),
+                width=adapter_width,
+                stride=1,
+                groups=1,  # BUG-4 FIX: use groups=1 for standard conv (depthwise requires width==inplanes)
+                dilation=1,
+                act_layer=nn.GELU
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -507,22 +510,23 @@ class UniqueBaseGrad(torch.autograd.Function):
 
 
 class RandLoraLayer(nn.Module):
-    def __init__(self, in_features, out_features, r, dropout=0.05, use_sparse=False, very_sparse=False, seed=42, scale=1.0):
+    def __init__(self, in_features, out_features, r, dropout=0.05, use_sparse=False, very_sparse=False, seed=None, scale=1.0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.r = r
         self.dropout = nn.Dropout(p=dropout)
-        self.n = math.ceil(min(in_features, out_features) / r)  # full-rank 보장
+        self.n = math.ceil(min(in_features, out_features) / r)
 
-        torch.manual_seed(seed)
+        # BUG-5 FIX: only set seed if explicitly provided (caller should pass unique seeds)
+        if seed is not None:
+            torch.manual_seed(seed)
         self._init_randbasis(use_sparse=use_sparse, very_sparse=very_sparse)
 
-        # Trainable parameters (scaling diagonal matrix)
         self.Lambda = nn.Parameter(torch.zeros(r, self.n))
         self.Gamma = nn.Parameter(torch.ones(self.n, min(in_features, out_features)) / max(in_features, out_features))
 
-        # scaling factor
+        # BUG-14 FIX: use consistent attribute name "scale"
         self.scale = scale if scale is not None else (1.0 / (r * math.sqrt(self.n)))
 
         self.reset_parameters()
@@ -571,7 +575,7 @@ class RandLoraLayer(nn.Module):
 
     def forward(self, x):
         update_A, update_B = self.get_scaled_bases()
-        lora_result = F.linear(F.linear(self.dropout(x), update_B), update_A) * self.scaling
+        lora_result = F.linear(F.linear(self.dropout(x), update_B), update_A) * self.scale
         return lora_result
         #return F.linear(F.linear(x, B), A) * self.scale
 
@@ -590,7 +594,7 @@ class LoraLayer(nn.Module):
         self.init_zero_all = init_zero_all
         
         self.lora_A = nn.Parameter(torch.randn(in_features, r))
-        self.lora_B = nn.Parameter(torch.randn(r, out_features))
+        self.lora_B = nn.Parameter(torch.zeros(r, out_features))  # BUG-13 FIX: init zeros directly
         self.dropout = nn.Dropout(p=drop_out)
         #self.drop_path = DropPath(drop_prob=self.drop_path_prob)
         self.reset_parameters() # 초기화
@@ -686,21 +690,28 @@ class Attention(nn.Module):
             self.lora_adapter_name = tuning_config.lora_adapter_name
             self.dropout = tuning_config.drop_out
 
+            # BUG-5 FIX: unique seed per RandLoRA layer using global counter
+            if not hasattr(Attention, '_randlora_counter'):
+                Attention._randlora_counter = 0
+
             if "to_q" in self.target_modules:
                 if self.lora_adapter_name == "lora":
                     self.lora_layers["to_q"] = LoraLayer(dim, self.inner_dim, self.lora_r, self.lora_alpha)
                 elif self.lora_adapter_name == "randlora":
-                    self.lora_layers["to_q"] = RandLoraLayer(dim, self.inner_dim, self.lora_r, use_sparse=self.use_sparse, very_sparse=self.very_sparse)
+                    Attention._randlora_counter += 1
+                    self.lora_layers["to_q"] = RandLoraLayer(dim, self.inner_dim, self.lora_r, use_sparse=self.use_sparse, very_sparse=self.very_sparse, seed=42 + Attention._randlora_counter)
             if "to_v" in self.target_modules:
                 if self.lora_adapter_name == "lora":
                     self.lora_layers["to_v"] = LoraLayer(dim, self.inner_dim, self.lora_r, self.lora_alpha)
                 elif self.lora_adapter_name == "randlora":
-                    self.lora_layers["to_v"] = RandLoraLayer(dim, self.inner_dim, self.lora_r, use_sparse=self.use_sparse, very_sparse=self.very_sparse)
+                    Attention._randlora_counter += 1
+                    self.lora_layers["to_v"] = RandLoraLayer(dim, self.inner_dim, self.lora_r, use_sparse=self.use_sparse, very_sparse=self.very_sparse, seed=42 + Attention._randlora_counter)
             if "to_k" in self.target_modules:
                 if self.lora_adapter_name == "lora":
                     self.lora_layers["to_k"] = LoraLayer(dim, self.inner_dim, self.lora_r, self.lora_alpha)
                 elif self.lora_adapter_name == "randlora":
-                    self.lora_layers["to_k"] = RandLoraLayer(dim, self.inner_dim, self.lora_r, use_sparse=self.use_sparse, very_sparse=self.very_sparse)
+                    Attention._randlora_counter += 1
+                    self.lora_layers["to_k"] = RandLoraLayer(dim, self.inner_dim, self.lora_r, use_sparse=self.use_sparse, very_sparse=self.very_sparse, seed=42 + Attention._randlora_counter)
 
 
         self.to_out = nn.ModuleList([])

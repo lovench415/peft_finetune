@@ -115,11 +115,16 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
                 - if use "byte", set to 256 (unicode byte range)
     """
     if tokenizer in ["pinyin", "char", "jamo"]:
-        kss_tokenizer_path = os.path.join(files("f5_tts").joinpath("../../data"), f"{dataset_name}_{tokenizer}/vocab_ko.txt")
+        # BUG-19 FIX: try dataset-specific vocab first, then fall back to pretrained
+        dataset_vocab_path = os.path.join(files("f5_tts").joinpath("../../data"), f"{dataset_name}_{tokenizer}/vocab.txt")
+        dataset_vocab_ko_path = os.path.join(files("f5_tts").joinpath("../../data"), f"{dataset_name}_{tokenizer}/vocab_ko.txt")
         pretrained_tokenizer_path = os.path.join(files("f5_tts").joinpath("../../data"), f"Emilia_ZH_EN_pinyin/vocab.txt")
-        if dataset_name == "KSS":
-            tokenizer_path = kss_tokenizer_path
-        else :
+
+        if os.path.exists(dataset_vocab_ko_path):
+            tokenizer_path = dataset_vocab_ko_path
+        elif os.path.exists(dataset_vocab_path):
+            tokenizer_path = dataset_vocab_path
+        else:
             tokenizer_path = pretrained_tokenizer_path
 
         print(f"tokenizer_path: {tokenizer_path}")
@@ -141,6 +146,9 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
             for i, char in enumerate(f):
                 vocab_char_map[char[:-1]] = i
         vocab_size = len(vocab_char_map)
+
+    else:
+        raise ValueError(f"Unknown tokenizer type: '{tokenizer}'. Must be one of: pinyin, char, jamo, byte, custom")
 
     return vocab_char_map, vocab_size
 
