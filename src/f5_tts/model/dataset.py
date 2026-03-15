@@ -200,7 +200,7 @@ def load_dataset(
 
     if dataset_type == "CustomDataset":
         # BUG-25 FIX: include tokenizer suffix in path (e.g. data/KSS_pinyin)
-        rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{tokenizer}"))
+        rel_data_path = str(files("f5_tts").joinpath(f"data/{dataset_name}_{tokenizer}"))
         print(f"rel_data_path : {rel_data_path}")
         #exit()
         if audio_type == "raw":
