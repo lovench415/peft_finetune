@@ -15,7 +15,6 @@ from tqdm import tqdm
 
 
 import sys
-sys.path.insert(0, "/workspace/PEFT-TTS/src")
 
 from f5_tts.eval.utils_eval import (
     get_inference_prompt,

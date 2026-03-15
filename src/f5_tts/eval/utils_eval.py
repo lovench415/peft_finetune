@@ -11,7 +11,6 @@ from tqdm import tqdm
 from importlib.resources import files
 
 import sys
-sys.path.insert(0, "/workspace/PEFT-TTS/src")
 
 from f5_tts.eval.ecapa_tdnn import ECAPA_TDNN_SMALL
 from f5_tts.model.modules import MelSpec

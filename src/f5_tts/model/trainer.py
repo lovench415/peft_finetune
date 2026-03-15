@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
-import sys
+from pathlib import Path
 
 import torch
 import torchaudio
@@ -11,13 +11,20 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from ema_pytorch import EMA
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR, SequentialLR, ConstantLR
+from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 
 from f5_tts.model import CFM
-from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
+from f5_tts.model.dataset import collate_fn
+from f5_tts.model.samplers import (
+    DynamicBatchSampler,
+    BucketDynamicBatchSampler,
+    SpeakerAwareBucketDynamicBatchSampler,
+    SpeakerBalancedDynamicBatchSampler,
+)
 from f5_tts.model.utils import default, exists
+from f5_tts.config.metadata import save_checkpoint_metadata
 
 # trainer
 
@@ -36,6 +43,14 @@ class Trainer:
         checkpoint_path=None,
         batch_size_per_gpu=32,
         batch_size_type: str = "sample",
+        bucket_batching: bool = False,
+        speaker_aware_batching: bool = False,
+        speaker_balanced_batching: bool = False,
+        bucket_size: int = 512,
+        max_speakers_per_batch: int = 8,
+        max_samples_per_speaker: int = 8,
+        speakers_per_batch: int = 8,
+        samples_per_speaker: int = 4,
         max_samples=32,
         grad_accumulation_steps=1,
         max_grad_norm=1.0,
@@ -53,7 +68,10 @@ class Trainer:
         mel_spec_type: str = "vocos",  # "vocos" | "bigvgan"
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
+        prosody_loss_weight: float = 0.0,
         cfg_dict: dict = None,  # training config
+        app_config=None,
+        checkpoint_metadata_extra: dict | None = None,
     ):
         # BUG-30 FIX: avoid mutable default arguments
         if accelerate_kwargs is None:
@@ -172,7 +190,18 @@ class Trainer:
 
         self.batch_size_per_gpu = batch_size_per_gpu
         self.batch_size_type = batch_size_type
+        self.bucket_batching = bucket_batching
+        self.speaker_aware_batching = speaker_aware_batching
+        self.speaker_balanced_batching = speaker_balanced_batching
+        self.bucket_size = bucket_size
+        self.max_speakers_per_batch = max_speakers_per_batch
+        self.max_samples_per_speaker = max_samples_per_speaker
+        self.speakers_per_batch = speakers_per_batch
+        self.samples_per_speaker = samples_per_speaker
         self.max_samples = max_samples
+        if self.speaker_aware_batching or self.speaker_balanced_batching:
+            if not hasattr(self.model, 'transformer'):
+                pass
         self.grad_accumulation_steps = grad_accumulation_steps
         self.max_grad_norm = max_grad_norm
 
@@ -182,6 +211,9 @@ class Trainer:
         self.local_vocoder_path = local_vocoder_path
 
         self.noise_scheduler = noise_scheduler
+        self.prosody_loss_weight = prosody_loss_weight
+        self.app_config = app_config
+        self.checkpoint_metadata_extra = checkpoint_metadata_extra or {}
 
         self.duration_predictor = duration_predictor
 
@@ -216,15 +248,18 @@ class Trainer:
             )
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
+
             if last:
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
+                ckpt_path = f"{self.checkpoint_path}/model_last.pt"
+                self.accelerator.save(checkpoint, ckpt_path)
                 print(f"Saved last checkpoint at update {update}")
             else:
                 if self.keep_last_n_checkpoints == 0:
                     return
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_{update}.pt")
-                if self.keep_last_n_checkpoints > 0 :
-                    # Update logic to exclude pretrained model from rotation
+                ckpt_path = f"{self.checkpoint_path}/model_{update}.pt"
+                self.accelerator.save(checkpoint, ckpt_path)
+
+                if self.keep_last_n_checkpoints > 0:
                     checkpoints = [
                         f
                         for f in os.listdir(self.checkpoint_path)
@@ -233,15 +268,21 @@ class Trainer:
                         and f.endswith(".pt")
                         and f != "model_last.pt"
                     ]
-                    checkpoints.sort(key=lambda x : int(x.split("_")[1].split(".")[0]))
+                    checkpoints.sort(key=lambda x: int(x.split("_")[1].split(".")[0]))
                     while len(checkpoints) > self.keep_last_n_checkpoints:
                         oldest_checkpoint = checkpoints.pop(0)
-                        os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
+                        oldest_path = os.path.join(self.checkpoint_path, oldest_checkpoint)
+                        os.remove(oldest_path)
+                        meta_path = Path(oldest_path).with_suffix(".meta.json")
+                        if meta_path.exists():
+                            meta_path.unlink()
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
+
+            if self.app_config is not None:
+                save_checkpoint_metadata(ckpt_path, self.app_config, extra=self.checkpoint_metadata_extra)
 
     def set_trainable_parameters(self):
         if self.adapter_config:
-            
             for param in self.model.parameters():
                 param.requires_grad = False
 
@@ -259,12 +300,23 @@ class Trainer:
                             elif 'lora_layers' in name:
                                 param.requires_grad = True
 
-            
+            # Always freeze pretrained embedding
             self.model.transformer.text_embed.text_embed.weight.requires_grad = False
-            self.model.transformer.text_embed.text_embed_ko.weight.requires_grad = False
-            
+            # BUG-34 FIX: only freeze text_embed_ko when it's not the active embedding
+            # alpha=1 means ko=True → text_embed_ko is active → should be trainable
+            if self.model.transformer.text_embed.alpha == 1:
+                self.model.transformer.text_embed.text_embed_ko.weight.requires_grad = True
+            else:
+                self.model.transformer.text_embed.text_embed_ko.weight.requires_grad = False
+
             for name, param in self.model.named_parameters():
                 if 'attn_norm.linear' in name and 'transformer_blocks' in name:
+                    param.requires_grad = True
+
+            # Prosody improvement: unfreeze final modulation layer
+            # norm_out.linear controls scale+shift of final output → directly affects energy contour
+            for name, param in self.model.named_parameters():
+                if 'norm_out.linear' in name:
                     param.requires_grad = True
 
     def load_checkpoint(self):
@@ -273,133 +325,88 @@ class Trainer:
             or not os.path.exists(self.checkpoint_path)
             or not any(filename.endswith((".pt", ".safetensors")) for filename in os.listdir(self.checkpoint_path))
         ):
-            # BUG-10 FIX: prepare model even when no checkpoint
             self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
             return 0
-        
 
         self.accelerator.wait_for_everyone()
-        # if model_last.pt in checkpoint_path -> use it
-        if "model_last.pt" in os.listdir(self.checkpoint_path):
-            print("there's model_last.pt")
-            latest_checkpoint = "model_last.pt"
 
-        
-        # if model_last.pt is not in checkpoint_path -> sort the rest of the checkpoints
+        if "model_last.pt" in os.listdir(self.checkpoint_path):
+            print("Found model_last.pt")
+            latest_checkpoint = "model_last.pt"
         else:
-            print("there's no model_last.pt")
+            print("No model_last.pt found")
             all_checkpoints = [
                 f
                 for f in os.listdir(self.checkpoint_path)
                 if (f.startswith("model_") or f.startswith("pretrained_")) and f.endswith((".pt", ".safetensors"))
             ]
-
-            # First try to find regular training checkpoints
             training_checkpoints = [f for f in all_checkpoints if f.startswith("model_") and f != "model_last.pt"]
             print(f"training_checkpoints : {training_checkpoints}")
-
 
             if training_checkpoints:
                 latest_checkpoint = sorted(
                     training_checkpoints,
-                    #[f for f in os.listdir(self.checkpoint_path) if f.endswith(".pt") and f.startswith("model")],
                     key=lambda x: int("".join(filter(str.isdigit, x))),
                 )[-1]
                 print(f"latest_checkpoint : {latest_checkpoint}")
-
-            else : 
-                # If no training checkpoints, use pretrained_model
+            else:
                 latest_checkpoint = next(f for f in all_checkpoints if f.startswith("pretrained_"))
 
-        if latest_checkpoint.endswith(".safetensors"): # always a pretrained checkpoint
+        if latest_checkpoint.endswith(".safetensors"):
             from safetensors.torch import load_file
-
-            checkpoint = load_file(f"{self.checkpoint_path}/{latest_checkpoint}", device="cpu") 
+            checkpoint = load_file(f"{self.checkpoint_path}/{latest_checkpoint}", device="cpu")
             checkpoint = {"ema_model_state_dict": checkpoint}
         elif latest_checkpoint.endswith(".pt"):
-            # checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", map_location=self.accelerator.device)  # rather use accelerator.load_state ಥ_ಥ
             checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", weights_only=True, map_location="cpu")
-            print(f"the latest_checkpoint of checkpoint path : {latest_checkpoint}")
+            print(f"Loaded checkpoint: {latest_checkpoint}")
 
-        # patch for backward compatibility, 305e3ea
+        # patch for backward compatibility
         for key in ["ema_model.mel_spec.mel_stft.mel_scale.fb", "ema_model.mel_spec.mel_stft.spectrogram.window"]:
-            if key in checkpoint["ema_model_state_dict"]:
+            if key in checkpoint.get("ema_model_state_dict", {}):
                 del checkpoint["ema_model_state_dict"][key]
 
-        # print checkpoint
         if self.view_training_procedure:
             print("Keys in checkpoint:", checkpoint.keys())
 
         if self.is_main:
-            
-            #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            
-            #self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"], strict=False)
-            """
-            old_weight = checkpoint["ema_model_state_dict"]['ema_model.transformer.text_embed.text_embed.weight'].to(device)
-            new_weight = self.ema_model.ema_model.transformer.text_embed.text_embed.weight.to(device)
-
-
-
-            old_dim, embed_dim = old_weight.shape
-            new_dim , embed_dim = new_weight.shape
-            if old_dim != new_dim:
-                print("The Vocab size is different with pretrained model")
-                print(f"Now excluding the text embedding size {old_dim} -> {new_dim}")
-                new_weight[:old_dim,:] = old_weight
-                checkpoint["ema_model_state_dict"]['ema_model.transformer.text_embed.text_embed.weight'] = new_weight
-
-                checkpoint["ema_model_state_dict"]['ema_model.transformer.text_embed.text_embed_ko.weight'] = new_weight
-            """
-            #checkpoint["ema_model_state_dict"]['ema_model.transformer.text_embed.text_embed_ko.weight']
- 
-            
             self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"], strict=False)
 
-        # is not the first trial to train the model with the checkpoint or the model_config
+        # Resuming from a training checkpoint
         if "update" in checkpoint or "step" in checkpoint:
-            # patch for backward compatibility, with before f992c4e
-            print("there's 'step' in checkpoint")
+            print("Resuming from training checkpoint")
 
             if "step" in checkpoint:
                 checkpoint["update"] = checkpoint["step"] // self.grad_accumulation_steps
                 if self.grad_accumulation_steps > 1 and self.is_main:
-                    print(
-                        "F5-TTS WARNING: Loading checkpoint waved with per_steps logic (before f99c43), will conver to per_updates according to grad_accumulation_steps setting, may have unexpected behavior."
-                    )
-            # patch for backward compatibility, 305e3ea
+                    print("WARNING: Converting old per_steps checkpoint to per_updates.")
+
             for key in ["mel_spec.mel_stft.mel_scale.fb", "mel_spec.mel_stft.spectrogram.window"]:
-                if key in checkpoint["model_state_dict"]:
+                if key in checkpoint.get("model_state_dict", {}):
                     del checkpoint["model_state_dict"][key]
-            
-            
+
             if self.adapter_config:
                 self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"], strict=True)
-                #self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint["optimizer_state_dict"])
                 self.set_trainable_parameters()
-
                 trainable_params = [param for param in self.model.parameters() if param.requires_grad]
                 self.optimizer = AdamW(trainable_params, lr=self.learning_rate)
-                self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)  
+                self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
             else:
                 self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
                 self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-            # Scheduler is created after load_checkpoint, so skip loading here.
-            # Position is restored via scheduler.step() loop after creation.
+            # Scheduler is created after load_checkpoint; position restored via scheduler.step() loop
             update = checkpoint["update"]
-        # first training procedure
+
+        # First training from pretrained weights
         else:
-            print("there's no 'step' in checkpoint") 
+            print("First training from pretrained weights")
             checkpoint["model_state_dict"] = {
                 k.replace("ema_model.", ""): v
                 for k, v in checkpoint["ema_model_state_dict"].items()
                 if k not in ["initted", "update", "step"]
             }
-                        
-            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"],strict=False)
-            #update = 0
+            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"], strict=False)
 
             if self.adapter_config:
                 self.set_trainable_parameters()
@@ -410,33 +417,96 @@ class Trainer:
                 trainable_params = [param for param in self.model.parameters() if param.requires_grad]
                 self.optimizer = AdamW(trainable_params, lr=self.learning_rate)
                 self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
-
             else:
-                # BUG-10 FIX: prepare in non-adapter first-training path
                 self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
-            #step = 0
             update = 0
 
-        if self.view_training_procedure :
+        if self.view_training_procedure:
             for name, param in self.model.named_parameters():
                 print(f"Parameter: {name}, Shape: {param.shape}, Requires Grad: {param.requires_grad}")
             exit()
-        
+
         del checkpoint
         gc.collect()
         return update
 
+    def _create_dataloader(self, train_dataset, num_workers, generator):
+        """Create the appropriate dataloader based on batching configuration."""
+        if self.batch_size_type == "sample":
+            return DataLoader(
+                train_dataset,
+                collate_fn=collate_fn,
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=True,
+                batch_size=self.batch_size_per_gpu,
+                shuffle=True,
+                generator=generator,
+            )
+
+        elif self.batch_size_type == "frame":
+            self.accelerator.even_batches = False
+            sampler = SequentialSampler(train_dataset)
+
+            if self.speaker_balanced_batching:
+                batch_sampler = SpeakerBalancedDynamicBatchSampler(
+                    sampler,
+                    self.batch_size_per_gpu,
+                    speakers_per_batch=self.speakers_per_batch,
+                    samples_per_speaker=self.samples_per_speaker,
+                    max_samples=self.max_samples,
+                    random_seed=None,
+                    drop_residual=False,
+                )
+            elif self.speaker_aware_batching:
+                batch_sampler = SpeakerAwareBucketDynamicBatchSampler(
+                    sampler,
+                    self.batch_size_per_gpu,
+                    max_samples=self.max_samples,
+                    bucket_size=self.bucket_size,
+                    max_speakers_per_batch=self.max_speakers_per_batch,
+                    max_samples_per_speaker=self.max_samples_per_speaker,
+                    random_seed=None,
+                    drop_residual=False,
+                )
+            elif self.bucket_batching:
+                batch_sampler = BucketDynamicBatchSampler(
+                    sampler,
+                    self.batch_size_per_gpu,
+                    max_samples=self.max_samples,
+                    bucket_size=self.bucket_size,
+                    random_seed=None,
+                    drop_residual=False,
+                )
+            else:
+                batch_sampler = DynamicBatchSampler(
+                    sampler,
+                    self.batch_size_per_gpu,
+                    max_samples=self.max_samples,
+                    random_seed=None,
+                    drop_residual=False,
+                )
+
+            return DataLoader(
+                train_dataset,
+                collate_fn=collate_fn,
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=True,
+                batch_sampler=batch_sampler,
+            )
+
+        else:
+            raise ValueError(f"batch_size_type must be 'sample' or 'frame', got '{self.batch_size_type}'")
+
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
-        #print(self.model)
-        
         view_training_procedure = self.view_training_procedure
+
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
-
-            #vocoder = load_vocoder(vocoder_name=self.vocoder_name)
             vocoder = load_vocoder(
-                vocoder_name= self.vocoder_name, is_local=self.is_local_vocoder, local_path=self.local_vocoder_path
+                vocoder_name=self.vocoder_name, is_local=self.is_local_vocoder, local_path=self.local_vocoder_path
             )
             target_sample_rate = self.accelerator.unwrap_model(self.model).mel_spec.target_sample_rate
             log_samples_path = f"{self.checkpoint_path}/samples"
@@ -448,70 +518,26 @@ class Trainer:
         else:
             generator = None
 
-        if self.batch_size_type == "sample":
-            train_dataloader = DataLoader(
-                train_dataset,
-                collate_fn=collate_fn,
-                num_workers=num_workers,
-                pin_memory=True,
-                persistent_workers=True,
-                batch_size=self.batch_size_per_gpu,
-                shuffle=True,
-                generator=generator,
-            )
-            print(f"train_dataloader.batch_size :{train_dataloader.batch_size}" )
-        elif self.batch_size_type == "frame":
-            self.accelerator.even_batches = False
-            sampler = SequentialSampler(train_dataset)
+        train_dataloader = self._create_dataloader(train_dataset, num_workers, generator)
 
-            #batch_sampler = DynamicBatchSampler(
-            #    sampler, self.batch_size, max_samples=self.max_samples, random_seed=resumable_with_seed, drop_last=False
-            #)
-            batch_sampler = DynamicBatchSampler(
-                sampler,
-                self.batch_size_per_gpu,
-                max_samples= self.max_samples,
-                random_seed= resumable_with_seed, # This enables reproducible shuffling
-                drop_residual= False,
-            )
-            train_dataloader = DataLoader(
-                train_dataset,
-                collate_fn=collate_fn,
-                num_workers=num_workers,
-                pin_memory=True,
-                persistent_workers=True,
-                batch_sampler=batch_sampler,
-            )
-            #print(f"train_dataloader.batch_size :{train_dataloader.batch_size}" )
-            if view_training_procedure:
-                pass
-                #for batch_idx, batch in enumerate(train_dataloader):
-                #    print(f"Batch {batch_idx + 1}: {len(batch)} samples")
-
-        else:
-            raise ValueError(f"batch_size_type must be either 'sample' or 'frame', but received {self.batch_size_type}")
-
-
-
-
-        #  accelerator.prepare() dispatches batches to devices;
-        #  which means the length of dataloader calculated before, should consider the number of devices
-        warmup_updates = (
-            self.num_warmup_updates * self.accelerator.num_processes
-        )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
-
+        # Scheduler setup
+        warmup_updates = self.num_warmup_updates * self.accelerator.num_processes
         total_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps) * self.epochs
-        # BUG-17 FIX: clamp decay_updates to at least 1
         decay_updates = max(1, total_updates - warmup_updates)
 
-        # Prepare dataloader first (without scheduler)
+        # Prepare dataloader
         train_dataloader = self.accelerator.prepare(train_dataloader)
 
-        ## LOADING CHECKPOINT -> ADAPTING LORA HERE
-        # This may replace self.optimizer with a new one (for PEFT trainable params only)
+        # Load checkpoint (may replace optimizer)
         start_update = self.load_checkpoint()
 
-        # BUG-16 FIX: create scheduler AFTER load_checkpoint, so it binds to the final optimizer
+        # Apply prosody loss weight to model
+        if self.prosody_loss_weight > 0:
+            self.accelerator.unwrap_model(self.model).prosody_loss_weight = self.prosody_loss_weight
+            if self.is_main:
+                print(f"Prosody-aware loss enabled: weight={self.prosody_loss_weight}")
+
+        # Create scheduler AFTER load_checkpoint so it binds to the final optimizer
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
         self.scheduler = SequentialLR(
@@ -524,7 +550,7 @@ class Trainer:
             self.scheduler.step()
 
         global_update = start_update
-        print(f'global_step : {global_update}')
+        print(f"Starting from update: {global_update}")
 
         if exists(resumable_with_seed):
             orig_epoch_step = len(train_dataloader)
@@ -535,36 +561,15 @@ class Trainer:
         else:
             skipped_epoch = 0
 
-        
-        ##### model.train
         for epoch in range(skipped_epoch, self.epochs):
             self.model.train()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
                 progress_bar_initial = math.ceil(skipped_batch / self.grad_accumulation_steps)
                 current_dataloader = skipped_dataloader
-                """
-                progress_bar = tqdm(
-                    skipped_dataloader,
-                    desc=f"Epoch {epoch+1}/{self.epochs}",
-                    unit="step",
-                    disable=not self.accelerator.is_local_main_process,
-                    initial=skipped_batch,
-                    total=orig_epoch_step,
-                )
-                """
             else:
                 progress_bar_initial = 0
                 current_dataloader = train_dataloader
-                """
-                progress_bar = tqdm(
-                    train_dataloader,
-                    desc=f"Epoch {epoch+1}/{self.epochs}",
-                    unit="step",
-                    disable=not self.accelerator.is_local_main_process,
-                )
-                """
 
-            # Set epoch for batch sampler if it exits
             if hasattr(train_dataloader, "batch_sampler") and hasattr(train_dataloader.batch_sampler, "set_epoch"):
                 train_dataloader.batch_sampler.set_epoch(epoch)
 
@@ -576,104 +581,28 @@ class Trainer:
                 initial=progress_bar_initial,
             )
 
-            #for batch in progress_bar:
             for batch in current_dataloader:
                 with self.accelerator.accumulate(self.model):
-                    #if view_traning_procedure :
-                    #    print(f"batch[text].shape : {batch['text'].shape}")
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
                     mel_lengths = batch["mel_lengths"]
 
-                    # TODO. add duration predictor training
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
-
-
-
-
-                    # compute loss in model
                     loss, cond, pred = self.model(
                         mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
                     )
-            
 
-                    # Backpropagation (Compute Gradient)
                     self.accelerator.backward(loss)
 
-                    """
-                    # LoRA 레이어에 대해 gradient를 0.05배로 스케일링
-                    for name, param in self.model.named_parameters():
-                        if "lora_layers" in name:
-                            if param.grad is not None: 
-                                param.grad *= 0.05  
-                    """
-                    if view_training_procedure:
-                        # Checking Gradient is whether is flooding
-                        for name, param in self.model.named_parameters():
-                            if param.requires_grad:
-                                print(f"Gradient for {name}: {param.grad is not None} (Mean: {param.grad.abs().mean().item() if param.grad is not None else 'None'})")
-                        
-
-
-                    # Gradient Clipping
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                    # Optimizer step 전 파라미터 저장
-                    if view_training_procedure:
-                        print("=== Optimizer State ===")
-                        optimizer_state = self.optimizer.state_dict()
-
-
-
-
-                        before_params = {name: param.clone() for name, param in self.model.named_parameters() if param.requires_grad}
-                        # BUG-18 FIX: unwrap model for direct attribute access after DDP
-                        _model = self.accelerator.unwrap_model(self.model)
-                        zhen_embedding = _model.transformer.text_embed.text_embed.weight[:,:].clone()
-                        ko_embedding = _model.transformer.text_embed.text_embed_ko.weight[:,:].clone()
-
-
-                        # Optimizer Step
-                        self.optimizer.step()
-                        self.scheduler.step()
-                        self.optimizer.zero_grad()
-
-                        # Comparing parameters after Optimizer step
-                        for name, param in self.model.named_parameters():
-                            if param.requires_grad:
-                                is_updated = not torch.equal(before_params[name], param)
-                                print(f"Parameter {name} updated: {is_updated}")
-                        
-                        param_to_name = {param: name for name, param in self.model.named_parameters()}
-                        for group in self.optimizer.param_groups:
-                            for param in group['params']:
-                                param_name = param_to_name.get(param, "Unnamed Parameter")
-                                print(f"Name: {param_name}, Shape: {param.shape}, Requires Grad: {param.requires_grad}")
-
-                        # check if original embedding has changed
-                        _model = self.accelerator.unwrap_model(self.model)
-                        zhen_updated_embedding = _model.transformer.text_embed.text_embed.weight[:,:]
-                        ko_updated_embedding = _model.transformer.text_embed.text_embed_ko.weight[:,:]
-                        
-                        if torch.equal(zhen_embedding[:,:], zhen_updated_embedding[:,:]):
-                            print(f"No Changed Zh & EN!")
-                        else: 
-                            print(f"changed Zh & EN")
-
-                        if torch.equal(ko_embedding[:,:], ko_updated_embedding[:,:]):
-                            print(f"No Changed KO!")
-                        else:
-                            print(f"changed KO")
-
-
-                    else :
-                        self.optimizer.step()
-                        self.scheduler.step()
-                        self.optimizer.zero_grad()
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
 
                 if self.accelerator.sync_gradients:
                     if self.is_main:
@@ -683,44 +612,17 @@ class Trainer:
                     progress_bar.update(1)
                     progress_bar.set_postfix(update=str(global_update), loss=loss.item())
 
-                """        
-                if self.is_main:
-                    self.ema_model.update()
-                    if view_training_procedure:
-                        print(f"global_step : {global_step}")
-
-                        exit()
-                        #pass
-                
-                global_step += 1
-                """
-
-
                 if self.accelerator.is_local_main_process:
                     self.accelerator.log({"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update)
                     if self.logger == "tensorboard":
                         self.writer.add_scalar("loss", loss.item(), global_update)
                         self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
 
-                #progress_bar.set_postfix(step=str(global_step), loss=loss.item())
-
-                #if global_step % (self.save_per_updates * self.grad_accumulation_steps) == 0:
-                if global_update % self.save_per_updates == 0 and self.accelerator.sync_gradients :
+                if global_update % self.save_per_updates == 0 and self.accelerator.sync_gradients:
                     self.save_checkpoint(global_update)
 
                     if self.log_samples and self.accelerator.is_local_main_process:
-                        """
-                        ref_audio, ref_audio_len = vocoder.decode(batch["mel"][0].unsqueeze(0)), mel_lengths[0]
-                        
-                        torchaudio.save(
-                            f"{log_samples_path}/step_{global_step}_ref.wav", ref_audio.cpu(), target_sample_rate
-                        )
-                        """
                         ref_audio_len = mel_lengths[0]
-                        infer_text = [
-                            text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
-                        ]
-
                         with torch.inference_mode():
                             generated, _ = self.accelerator.unwrap_model(self.model).sample(
                                 cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
@@ -749,10 +651,7 @@ class Trainer:
 
                 if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
                     self.save_checkpoint(global_update, last=True)
-            
-            
-
 
         self.save_checkpoint(global_update, last=True)
-
         self.accelerator.end_training()
+

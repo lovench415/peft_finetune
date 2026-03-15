@@ -10,13 +10,14 @@ d - dimension
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 import torchaudio
 from librosa.filters import mel as librosa_mel_fn
 from torch import nn
+from torch import Tensor
 from x_transformers.x_transformers import apply_rotary_pos_emb
 
 
@@ -234,10 +235,6 @@ class GRN(nn.Module):
 
 # ConvNeXt-V2 Block https://github.com/facebookresearch/ConvNeXt-V2/blob/main/models/convnextv2.py
 # ref: https://github.com/bfs18/e2_tts/blob/main/rfwave/modules.py#L108
-from typing import Callable, List, Optional
-import torch
-from torch import Tensor
-import torch.nn as nn
 
 class SqueezeExcitation(torch.nn.Module):
     """
@@ -354,7 +351,7 @@ class ConvNeXtV2Block(nn.Module):
         if self.tuning_config and 'conv_adapt' in self.tuning_config.method:
             # BUG-3 FIX: multiply by adapt_size to compress (not divide)
             # adapt_size=0.25 → width = dim * 0.25 = 128 (compression to 25%)
-            adapter_width = max(1, int(dim * self.tuning_config.adapt_size))
+            adapter_width = max(1, int(dim // self.tuning_config.adapt_size))
             self.conv_adapter = ConvAdapter(
                 dim, dim,
                 kernel_size=int(self.tuning_config.kernel_size),
@@ -395,7 +392,13 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        self.native_rms_norm = float(torch.__version__[:3]) >= 2.4
+        # BUG-37 FIX: robust version check (handles 2.10+, nightly builds, etc.)
+        try:
+            _major, _minor = torch.__version__.split(".")[:2]
+            _torch_version = (int(_major), int(_minor.split("+")[0].split("a")[0].split("b")[0].split("rc")[0]))
+            self.native_rms_norm = _torch_version >= (2, 4)
+        except (ValueError, IndexError):
+            self.native_rms_norm = False
 
     def forward(self, x):
         if self.native_rms_norm:
@@ -667,7 +670,6 @@ class Attention(nn.Module):
         if self.context_dim is not None:
             self.to_k_c = nn.Linear(context_dim, self.inner_dim)
             self.to_v_c = nn.Linear(context_dim, self.inner_dim)
-            self.to_v_c = nn.Linear(context_dim, self.inner_dim)
             if qk_norm is None:
                 self.c_q_norm = None
                 self.c_k_norm = None
@@ -688,7 +690,7 @@ class Attention(nn.Module):
             self.use_sparse = tuning_config.use_sparse
             self.very_sparse = tuning_config.very_sparse
             self.lora_adapter_name = tuning_config.lora_adapter_name
-            self.dropout = tuning_config.drop_out
+            self.lora_dropout = tuning_config.drop_out
 
             # BUG-5 FIX: unique seed per RandLoRA layer using global counter
             if not hasattr(Attention, '_randlora_counter'):

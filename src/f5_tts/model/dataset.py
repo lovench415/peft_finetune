@@ -1,19 +1,19 @@
 import json
-import random
+from pathlib import Path
 from importlib.resources import files
 
-import os
 import torch
 import torch.nn.functional as F
 import torchaudio
 from datasets import Dataset as Dataset_
-from datasets import load_from_disk
+from datasets import load_dataset as hf_load_dataset, load_from_disk
 from torch import nn
 from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import default
+
 
 
 class HFDataset(Dataset):
@@ -30,6 +30,7 @@ class HFDataset(Dataset):
         self.data = hf_dataset
         self.target_sample_rate = target_sample_rate
         self.hop_length = hop_length
+        self._resamplers = {}
 
         self.mel_spectrogram = MelSpec(
             n_fft=n_fft,
@@ -40,45 +41,46 @@ class HFDataset(Dataset):
             mel_spec_type=mel_spec_type,
         )
 
+        self.valid_indices = []
+        for idx in range(len(self.data)):
+            row = self.data[idx]
+            audio = row["audio"]["array"]
+            sample_rate = row["audio"]["sampling_rate"]
+            duration = audio.shape[-1] / sample_rate
+            if 0.3 <= duration <= 30:
+                self.valid_indices.append(idx)
+
+        if not self.valid_indices:
+            raise RuntimeError("No valid audio samples found in HFDataset")
+
+    def _resolve_index(self, index):
+        return self.valid_indices[index]
+
     def get_frame_len(self, index):
-        row = self.data[index]
+        row = self.data[self._resolve_index(index)]
         audio = row["audio"]["array"]
         sample_rate = row["audio"]["sampling_rate"]
-        return audio.shape[-1] / sample_rate * self.target_sample_rate / self.hop_length
+        return int(audio.shape[-1] / sample_rate * self.target_sample_rate / self.hop_length)
+
+    def get_speaker(self, index):
+        row = self.data[self._resolve_index(index)]
+        return row.get("speaker", row.get("speaker_id", "default"))
 
     def __len__(self):
-        return len(self.data)
+        return len(self.valid_indices)
 
     def __getitem__(self, index):
-        row = self.data[index]
+        row = self.data[self._resolve_index(index)]
         audio = row["audio"]["array"]
-
-        # logger.info(f"Audio shape: {audio.shape}")
-
         sample_rate = row["audio"]["sampling_rate"]
-        duration = audio.shape[-1] / sample_rate
-
-        if duration > 30 or duration < 0.3:
-            return self.__getitem__((index + 1) % len(self.data))
-
-        audio_tensor = torch.from_numpy(audio).float()
-
+        audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
         if sample_rate != self.target_sample_rate:
-            resampler = torchaudio.transforms.Resample(sample_rate, self.target_sample_rate)
-            audio_tensor = resampler(audio_tensor)
+            if sample_rate not in self._resamplers:
+                self._resamplers[sample_rate] = torchaudio.transforms.Resample(sample_rate, self.target_sample_rate)
+            audio_tensor = self._resamplers[sample_rate](audio_tensor)
+        mel_spec = self.mel_spectrogram(audio_tensor).squeeze(0)
+        return {"mel_spec": mel_spec, "text": row["text"]}
 
-        audio_tensor = audio_tensor.unsqueeze(0)  # 't -> 1 t')
-
-        mel_spec = self.mel_spectrogram(audio_tensor)
-
-        mel_spec = mel_spec.squeeze(0)  # '1 d t -> d t'
-
-        text = row["text"]
-
-        return dict(
-            mel_spec=mel_spec,
-            text=text,
-        )
 
 
 class CustomDataset(Dataset):
@@ -103,6 +105,7 @@ class CustomDataset(Dataset):
         self.win_length = win_length
         self.mel_spec_type = mel_spec_type
         self.preprocessed_mel = preprocessed_mel
+        self._resamplers = {}
 
         if not preprocessed_mel:
             self.mel_spectrogram = default(
@@ -116,162 +119,62 @@ class CustomDataset(Dataset):
                     mel_spec_type=mel_spec_type,
                 ),
             )
-  
+
+        self.valid_indices = []
+        for idx in range(len(self.data)):
+            row = self.data[idx]
+            duration = self.durations[idx] if self.durations is not None else row["duration"]
+            if 0.3 <= duration <= 30:
+                self.valid_indices.append(idx)
+
+        if not self.valid_indices:
+            raise RuntimeError("No valid samples found in CustomDataset")
+
+    def _resolve_index(self, index):
+        return self.valid_indices[index]
+
     def get_frame_len(self, index):
-        if (
-            self.durations is not None
-        ):  # Please make sure the separately provided durations are correct, otherwise 99.99% OOM
-            return self.durations[index] * self.target_sample_rate / self.hop_length
-        return self.data[index]["duration"] * self.target_sample_rate / self.hop_length
+        raw_index = self._resolve_index(index)
+        if self.durations is not None:
+            return int(self.durations[raw_index] * self.target_sample_rate / self.hop_length)
+        return int(self.data[raw_index]["duration"] * self.target_sample_rate / self.hop_length)
+
+    def get_speaker(self, index):
+        row = self.data[self._resolve_index(index)]
+        if "speaker" in row:
+            return row["speaker"]
+        if "speaker_id" in row:
+            return row["speaker_id"]
+        if "audio_path" in row:
+            return Path(row["audio_path"]).parent.name
+        return "default"
 
     def __len__(self):
-        return len(self.data)
+        return len(self.valid_indices)
 
     def __getitem__(self, index):
-        #print(f"index : {index}")
-        while True:
-            row = self.data[index]
-            audio_path = row["audio_path"]
-            text = row["text"]
-            duration = row["duration"]
-
-            # filter by given length
-            if 0.3 <= duration <= 30:
-                break  # valid
-
-            index = (index + 1) % len(self.data)
+        row = self.data[self._resolve_index(index)]
 
         if self.preprocessed_mel:
             mel_spec = torch.tensor(row["mel_spec"])
+            text = row["text"]
+            return {"mel_spec": mel_spec, "text": text}
 
-        else:
-            audio, source_sample_rate = torchaudio.load(audio_path)
-            if audio.shape[0] > 1:
-                audio = torch.mean(audio, dim=0, keepdim=True)
+        audio_path = row["audio_path"]
+        text = row["text"]
+        audio, source_sample_rate = torchaudio.load(audio_path)
+        if audio.shape[0] > 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
 
-            #if duration > 30 or duration < 0.3:
-            #    return self.__getitem__((index + 1) % len(self.data))
+        if source_sample_rate != self.target_sample_rate:
+            if source_sample_rate not in self._resamplers:
+                self._resamplers[source_sample_rate] = torchaudio.transforms.Resample(
+                    source_sample_rate, self.target_sample_rate
+                )
+            audio = self._resamplers[source_sample_rate](audio)
 
-            if source_sample_rate != self.target_sample_rate:
-                resampler = torchaudio.transforms.Resample(source_sample_rate, self.target_sample_rate)
-                audio = resampler(audio)
-
-            mel_spec = self.mel_spectrogram(audio)
-            mel_spec = mel_spec.squeeze(0)  # '1 d t -> d t')
-
-
-#######################################################    
-        """
-        import numpy as np
-        sample_dict = {
-            "text": "".join(text),
-            "audio_path": audio_path,
-            "duration": duration,
-            # numpy array는 바로 json serializable 하지 않으므로 list로 변환하거나,
-            # 필요 시 별도의 바이너리 형식(npy)로 저장할 수 있습니다.
-            "mel": mel_spec.cpu().numpy().tolist()
-        }
-        import json
-
-        with open(f"gt_mel/ground_truth_mel_{index}.json", "w", encoding="utf-8") as f:
-            json.dump(sample_dict, f, ensure_ascii=False, indent=4)
-        #np.save(f"gt_mel/ground_truth_mel_{index}.npy", mel_spec.cpu().numpy())
-        print(f"sucessfully saved {index}th gt mel")
-        """
-#######################################################    
-        return {
-            "mel_spec" : mel_spec,
-            "text" : text,
-        }
-
-
-# Dynamic Batch Sampler
-
-
-class DynamicBatchSampler(Sampler[list[int]]):
-    """Extension of Sampler that will do the following:
-    1.  Change the batch size (essentially number of sequences)
-        in a batch to ensure that the total number of frames are less
-        than a certain threshold.
-    2.  Make sure the padding efficiency in the batch is high.
-    3.  Shuffle batches each epoch while maintaining reproducibility.
-    """
-
-    def __init__(
-        self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_residual: bool = False #drop_last: bool = False
-    ):
-        self.sampler = sampler
-        self.frames_threshold = frames_threshold
-        self.max_samples = max_samples
-        self.random_seed = random_seed
-        self.epoch = 0
-
-        indices, batches = [], []
-        data_source = self.sampler.data_source
-
-        for idx in tqdm(
-            self.sampler, desc="Sorting with sampler... if slow, check whether dataset is provided with duration"
-        ):
-            indices.append((idx, data_source.get_frame_len(idx)))
-        indices.sort(key=lambda elem: elem[1])
-
-        batch = []
-        batch_frames = 0
-        for idx, frame_len in tqdm(
-            indices, desc=f"Creating dynamic batches with {frames_threshold} audio frames per gpu"
-        ):
-            if batch_frames + frame_len <= self.frames_threshold and (max_samples == 0 or len(batch) < max_samples):
-                batch.append(idx)
-                batch_frames += frame_len
-            else:
-                if len(batch) > 0:
-                    batches.append(batch)
-                if frame_len <= self.frames_threshold:
-                    batch = [idx]
-                    batch_frames = frame_len
-                else:
-                    batch = []
-                    batch_frames = 0
-
-        #if not drop_last and len(batch) > 0:
-        if not drop_residual and len(batch) > 0:
-            batches.append(batch)
-
-        del indices
-
-        # if want to have different batches between epochs, may just set a seed and log it in ckpt
-        # cuz during multi-gpu training, although the batch on per gpu not change between epochs, the formed general minibatch is different
-        # e.g. for epoch n, use (random_seed + n)
-        #random.seed(random_seed)
-        #random.shuffle(batches)
-
-        self.batches = batches
-
-        # Ensure even batches with accelerate BatchSamplerShard cls under frame_per_batch setting
-        self.drop_last = True
-
-    def set_epoch(self, epoch: int) -> None:
-        """Sets the epoch for this sampler."""
-        self.epoch = epoch
-
-    def __iter__(self):
-                # Use both random_seed and epoch for deterministic but different shuffling per epoch
-        if self.random_seed is not None:
-            g = torch.Generator()
-            g.manual_seed(self.random_seed + self.epoch)
-            # Use PyTorch's random permutation for better reproducibility across PyTorch versions
-            indices = torch.randperm(len(self.batches), generator=g).tolist()
-            batches = [self.batches[i] for i in indices]
-        else:
-            batches = self.batches
-        return iter(batches)
-        #return iter(self.batches)
-
-    def __len__(self):
-        return len(self.batches)
-
-
-# Load dataset
+        mel_spec = self.mel_spectrogram(audio).squeeze(0)
+        return {"mel_spec": mel_spec, "text": text}
 
 
 def load_dataset(
@@ -293,9 +196,11 @@ def load_dataset(
     print("Loading dataset ...")
 
 
+    preprocessed_mel = False
+
     if dataset_type == "CustomDataset":
         # BUG-25 FIX: include tokenizer suffix in path (e.g. data/KSS_pinyin)
-        rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}"))
+        rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{tokenizer}"))
         print(f"rel_data_path : {rel_data_path}")
         #exit()
         if audio_type == "raw":
@@ -331,7 +236,11 @@ def load_dataset(
             data_dict = json.load(f)
         durations = data_dict["duration"]
         train_dataset = CustomDataset(
-            train_dataset, durations=durations, preprocessed_mel=preprocessed_mel, **mel_spec_kwargs
+            train_dataset,
+            durations=durations,
+            preprocessed_mel=preprocessed_mel,
+            mel_spec_module=mel_spec_module,
+            **mel_spec_kwargs,
         )
 
     elif dataset_type == "HFDataset":
@@ -341,7 +250,8 @@ def load_dataset(
         )
         pre, post = dataset_name.split("_")
         train_dataset = HFDataset(
-            load_dataset(f"{pre}/{pre}", split=f"train.{post}", cache_dir=str(files("f5_tts").joinpath("../../data"))),
+            hf_load_dataset(f"{pre}/{pre}", split=f"train.{post}", cache_dir=str(files("f5_tts").joinpath("../../data"))),
+            **mel_spec_kwargs,
         )
 
     return train_dataset

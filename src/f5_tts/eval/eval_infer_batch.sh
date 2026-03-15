@@ -11,8 +11,8 @@ for dn in "${dataset_name[@]}"; do
             CUDA_VISIBLE_DEVICES=1 python eval_infer_batch.py -d $dn -sp $sp -c $c
 
             for m in "${metric[@]}"; do
-                echo "Running: python eval_PEFT-TTS_testset.py -m $m -d $dn -sp $sp -c $c"
-                python eval_PEFT-TTS_testset.py -m $m -d $dn -sp $sp -c $c
+                echo "Running: python eval_peft_tts_testset.py -m $m -d $dn -sp $sp -c $c"
+                python eval_peft_tts_testset.py -m $m -d $dn -sp $sp -c $c
             done
         done
     done

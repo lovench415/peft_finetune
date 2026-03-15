@@ -1,421 +1,228 @@
+
 import argparse
-import codecs
-import os
 import re
-from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
 
-import sys
-sys.path.insert(0, "/workspace/PEFT-TTS/src")
-
 import numpy as np
 import soundfile as sf
-import tomli
-from cached_path import cached_path
-from omegaconf import OmegaConf
-from f5_tts.train.hparam import get_model_cfg
 
-import numpy as np
-
+from f5_tts.config import (
+    build_infer_app_config_from_args,
+    validate_infer_config,
+    resolve_model_cls,
+    default_vocoder_local_path,
+    print_infer_summary,
+)
 from f5_tts.infer.utils_infer import (
-    mel_spec_type,
-    target_rms,
-    cross_fade_duration,
-    nfe_step,
-    cfg_strength,
-    sway_sampling_coef,
-    speed,
-    fix_duration,
     infer_process,
     load_model,
     load_vocoder,
     preprocess_ref_audio_text,
     remove_silence_for_generated_wav,
 )
-from f5_tts.model import DiT, UNetT  # noqa: F401. used for config
+
+DEFAULT_MODEL = "PEFT-TTS_base"
+VOICE_TAG_SPLIT = r"(?=\[\w+\])"
+VOICE_TAG_MATCH = r"\[(\w+)\]"
 
 
-parser = argparse.ArgumentParser(
-    prog="python3 infer-cli.py",
-    description="Commandline interface for E2/F5 TTS with Advanced Batch Processing.",
-    epilog="Specify options above to override one or more settings from config.",
-)
-parser.add_argument(
-    "-c",
-    "--config",
-    type=str,
-    default=os.path.join(files("f5_tts").joinpath("infer/examples/single"), "single.toml"),
-    help="The configuration file, default see infer/examples/basic/basic.toml",
-)
-
-
-# Note. Not to provide default value here in order to read default from config file
-
-parser.add_argument(
-    "-m",
-    "--model",
-    type=str,
-    default= "PEFT-TTS_base",
-    help="The model name: PEFT-TTS_base | PEFT-TTS_v1 | F5TTS_v1_Base | F5TTS_Base | E2TTS_Base | etc.",
-)
-parser.add_argument(
-    "-mc",
-    "--model_cfg",
-    type=str,
-    help="The path to F5-TTS model config file .yaml",
-)
-parser.add_argument(
-    "-p",
-    "--ckpt_file",
-    type=str,
-    help="The path to model checkpoint .pt, leave blank to use default",
-)
-parser.add_argument(
-    "-v",
-    "--vocab_file",
-    type=str,
-    help="The path to vocab file .txt, leave blank to use default",
-)
-parser.add_argument(
-    "-r",
-    "--ref_audio",
-    type=str,
-    help="The reference audio file.",
-)
-parser.add_argument(
-    "-s",
-    "--ref_text",
-    type=str,
-    help="The transcript/subtitle for the reference audio",
-)
-parser.add_argument(
-    "-t",
-    "--gen_text",
-    type=str,
-    help="The text to make model synthesize a speech",
-)
-parser.add_argument(
-    "-f",
-    "--gen_file",
-    type=str,
-    help="The file with text to generate, will ignore --gen_text",
-)
-parser.add_argument(
-    "-o",
-    "--output_dir",
-    type=str,
-    help="The path to output folder",
-)
-parser.add_argument(
-    "-w",
-    "--output_file",
-    type=str,
-    help="The name of output file",
-)
-parser.add_argument(
-    "--save_chunk",
-    action="store_true",
-    help="To save each audio chunks during inference",
-)
-parser.add_argument(
-    "--remove_silence",
-    action="store_true",
-    help="To remove long silence found in ouput",
-)
-parser.add_argument(
-    "--load_vocoder_from_local",
-    action="store_true",
-    help="To load vocoder from local dir, default to ../checkpoints/vocos-mel-24khz",
-)
-parser.add_argument(
-    "--vocoder_name",
-    type=str,
-    choices=["vocos", "bigvgan"],
-    help=f"Used vocoder name: vocos | bigvgan, default {mel_spec_type}",
-)
-parser.add_argument(
-    "--target_rms",
-    type=float,
-    help=f"Target output speech loudness normalization value, default {target_rms}",
-)
-parser.add_argument(
-    "--cross_fade_duration",
-    type=float,
-    help=f"Duration of cross-fade between audio segments in seconds, default {cross_fade_duration}",
-)
-parser.add_argument(
-    "--nfe_step",
-    type=int,
-    help=f"The number of function evaluation (denoising steps), default {nfe_step}",
-)
-parser.add_argument(
-    "--cfg_strength",
-    type=float,
-    help=f"Classifier-free guidance strength, default {cfg_strength}",
-)
-parser.add_argument(
-    "--sway_sampling_coef",
-    type=float,
-    help=f"Sway Sampling coefficient, default {sway_sampling_coef}",
-)
-parser.add_argument(
-    "--speed",
-    type=float,
-    help=f"The speed of the generated audio, default {speed}",
-)
-parser.add_argument(
-    "--fix_duration",
-    type=float,
-    help=f"Fix the total duration (ref and gen audios) in seconds, default {fix_duration}",
-)
-parser.add_argument(
-    "-cu",
-    "--ckpt_update",
-    type=int,
-    default=355000,
-    help=f"Specific checkpoint update to use in inference"
-)
-parser.add_argument(
-    "-nv",
-    "--normalizing_version",
-    type=int
-)
-args = parser.parse_args()
-
-
-# config file
-
-config = tomli.load(open(args.config, "rb"))
-
-
-# command-line interface parameters
-
-model = args.model or config.get("model", "PEFT-TTS_base")#"F5TTS_v1_Base")
-#model = "F5TTS_base"
-
-ckpt_file = f"../../../ckpts/KSS/{model}/model_{args.ckpt_update}.pt" # PEFT-TTS
-
-vocab_file = args.vocab_file or config.get("vocab_file", "")
-
-ref_audio = args.ref_audio or config.get("ref_audio", "infer/examples/basic/basic_ref_kr.wav")
-ref_text = (
-    args.ref_text
-    if args.ref_text is not None
-    else config.get("ref_text", "부모가 저지르는 큰 실수중 하나는, 자기 아이를 다른 집 아이와 비교하는 것이다.")
-)
-gen_text = args.gen_text or config.get("gen_text", "Here we generate something just for test.")
-gen_file = args.gen_file or config.get("gen_file", "")
-
-output_dir = args.output_dir or config.get("output_dir", "tests")
-output_file = args.output_file or config.get(
-    "output_file", f"infer_cli_{datetime.now().strftime(r'%Y%m%d_%H%M%S')}.wav"
-)
-
-save_chunk = args.save_chunk or config.get("save_chunk", False)
-remove_silence = args.remove_silence or config.get("remove_silence", False)
-load_vocoder_from_local = args.load_vocoder_from_local or config.get("load_vocoder_from_local", False)
-
-vocoder_name = args.vocoder_name or config.get("vocoder_name", mel_spec_type)
-target_rms = args.target_rms or config.get("target_rms", target_rms)
-cross_fade_duration = args.cross_fade_duration or config.get("cross_fade_duration", cross_fade_duration)
-nfe_step = args.nfe_step or config.get("nfe_step", nfe_step)
-cfg_strength = args.cfg_strength or config.get("cfg_strength", cfg_strength)
-sway_sampling_coef = args.sway_sampling_coef or config.get("sway_sampling_coef", sway_sampling_coef)
-speed = args.speed or config.get("speed", speed)
-fix_duration = args.fix_duration or config.get("fix_duration", fix_duration)
-
-
-# patches for pip pkg user
-if "infer/examples/" in ref_audio:
-    ref_audio = str(files("f5_tts").joinpath(f"{ref_audio}"))
-if "infer/examples/" in gen_file:
-    gen_file = str(files("f5_tts").joinpath(f"{gen_file}"))
-if "voices" in config:
-    for voice in config["voices"]:
-        voice_ref_audio = config["voices"][voice]["ref_audio"]
-        if "infer/examples/" in voice_ref_audio:
-            config["voices"][voice]["ref_audio"] = str(files("f5_tts").joinpath(f"{voice_ref_audio}"))
-
-
-# ignore gen_text if gen_file provided
-
-if gen_file:
-    gen_text = codecs.open(gen_file, "r", "utf-8").read()
-
-
-# output path
-
-wave_path = Path(output_dir) / output_file
-# spectrogram_path = Path(output_dir) / "infer_cli_out.png"
-if save_chunk:
-    output_chunk_dir = os.path.join(output_dir, f"{Path(output_file).stem}_chunks")
-    if not os.path.exists(output_chunk_dir):
-        os.makedirs(output_chunk_dir)
-
-
-# load vocoder
-
-if vocoder_name == "vocos":
-    vocoder_local_path = "../checkpoints/vocos-mel-24khz"
-elif vocoder_name == "bigvgan":
-    vocoder_local_path = "../checkpoints/bigvgan_v2_24khz_100band_256x"
-
-vocoder = load_vocoder(vocoder_name=vocoder_name, is_local=load_vocoder_from_local, local_path=vocoder_local_path)
-
-print(f"model : {model}")
-
-# load TTS model
-if model == "PEFT-TTS_base":
-    base_config = dict(
-        dim=1024,
-        depth=22,
-        heads=16,
-        ff_mult=2,
-        text_dim=512,
-        text_mask_padding=False,
-        conv_layers=4,
-        pe_attn_head=1,
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m f5_tts.infer.infer_cli",
+        description="Command-line inference for PEFT-TTS / F5-TTS.",
+        epilog="CLI values override config values.",
     )
-    model_cfg, adapter_config, adpt_dict = get_model_cfg(base_config)
-    model_cls = DiT
-elif model == "PEFT-TTS_v1":
-    base_config = dict(
-        dim=1024,
-        depth=22,
-        heads=16,
-        ff_mult=2,
-        text_dim=512,
-        conv_layers=4,
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        default=str(files("f5_tts").joinpath("infer/examples/single/single.toml")),
+        help="Path to TOML config. Optional when using --ckpt_file with saved checkpoint metadata.",
     )
-    model_cfg, adapter_config, adpt_dict = get_model_cfg(base_config)
-    model_cls = DiT
-elif model == "F5TTS_base":
-    model_cfg = dict(
-        dim=1024,
-        depth=22,
-        heads=16,
-        ff_mult=2,
-        text_dim=512,
-        text_mask_padding=False,
-        conv_layers=4,
-        pe_attn_head=1,
-    )
-    model_cls = DiT
-else:
-    model_cfg = OmegaConf.load(
-        args.model_cfg or config.get("model_cfg", str(files("f5_tts").joinpath(f"configs/{model}.yaml")))
-    ).model
-    model_cls = globals()[model_cfg.backbone]
+    parser.add_argument("-m", "--model", type=str, default=None,
+        help=f"Model name override. Defaults to checkpoint metadata, config, then {DEFAULT_MODEL}.")
+    parser.add_argument("-mc", "--model_cfg", type=str, help="Path to YAML model config.")
+    parser.add_argument("-p", "--ckpt_file", type=str, help="Path to checkpoint file.")
+    parser.add_argument("-v", "--vocab_file", type=str, help="Path to vocab file.")
+    parser.add_argument("-r", "--ref_audio", type=str, help="Reference audio file.")
+    parser.add_argument("-s", "--ref_text", type=str, help="Reference transcript.")
+    parser.add_argument("-t", "--gen_text", type=str, help="Text to synthesize.")
+    parser.add_argument("-f", "--gen_file", type=str, help="UTF-8 text file with generation text.")
+    parser.add_argument("-o", "--output_dir", type=str, help="Output directory.")
+    parser.add_argument("-w", "--output_file", type=str, help="Output wav file name.")
+    parser.add_argument("--save_chunk", action="store_true", help="Save generated chunks separately.")
+    parser.add_argument("--remove_silence", action="store_true", help="Trim long silences from output.")
+    parser.add_argument("--load_vocoder_from_local", action="store_true")
+    parser.add_argument("--vocoder_name", type=str, choices=["vocos", "bigvgan"])
+    parser.add_argument("--target_rms", type=float)
+    parser.add_argument("--cross_fade_duration", type=float)
+    parser.add_argument("--nfe_step", type=int)
+    parser.add_argument("--cfg_strength", type=float)
+    parser.add_argument("--sway_sampling_coef", type=float)
+    parser.add_argument("--speed", type=float)
+    parser.add_argument("--fix_duration", type=float)
+    parser.add_argument("-cu", "--ckpt_update", type=int, default=355000)
+    parser.add_argument("-nv", "--normalizing_version", type=int)
+    return parser
 
 
 
-"""
-repo_name, ckpt_step, ckpt_type = "F5-TTS", 1250000, "safetensors"
 
-if model != "F5TTS_Base":
-    assert vocoder_name == model_cfg.mel_spec.mel_spec_type
-"""
-# override for previous models
-if model == "F5TTS_Base":
-    if vocoder_name == "vocos":
-        ckpt_step = 1200000
-    elif vocoder_name == "bigvgan":
-        model = "F5TTS_Base_bigvgan"
-        ckpt_type = "pt"
-elif model == "E2TTS_Base":
-    repo_name = "E2-TTS"
-    ckpt_step = 1200000
-
-if not ckpt_file:
-    ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}"))
-
-print(f"Using {model}...")
-ema_model = load_model(model_cls, model_cfg, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file)
+def parse_voice_chunks(gen_text: str):
+    for chunk in re.split(VOICE_TAG_SPLIT, gen_text):
+        if not chunk.strip():
+            continue
+        match = re.match(VOICE_TAG_MATCH, chunk)
+        if match:
+            voice = match.group(1)
+            text = re.sub(VOICE_TAG_MATCH, "", chunk).strip()
+        else:
+            voice = "main"
+            text = chunk.strip()
+        if text:
+            yield voice, text
 
 
-# inference process
+def build_voices(app_cfg) -> dict:
+    raw_config = getattr(app_cfg, "_raw_infer_config", {})
+    voices = dict(raw_config.get("voices", {}))
+    voices["main"] = {"ref_audio": app_cfg.infer.ref_audio, "ref_text": app_cfg.infer.ref_text}
+
+    for voice_name in list(voices.keys()):
+        print(f"Voice: {voice_name}")
+        ref_audio, ref_text = preprocess_ref_audio_text(
+            voices[voice_name]["ref_audio"],
+            voices[voice_name].get("ref_text", ""),
+        )
+        voices[voice_name]["ref_audio"] = ref_audio
+        voices[voice_name]["ref_text"] = ref_text
+
+    return voices
+
+
+def infer_segments(app_cfg, voices: dict, model, vocoder):
+    infer_cfg = app_cfg.infer
+    segments = []
+    mel_specs = []
+    output_chunk_dir = None
+
+    if infer_cfg.save_chunk:
+        output_chunk_dir = Path(infer_cfg.output_dir) / f"{Path(infer_cfg.output_file).stem}_chunks"
+        output_chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_rate = 24000
+    for idx, (voice_name, text) in enumerate(parse_voice_chunks(infer_cfg.gen_text)):
+        voice_cfg = voices.get(voice_name, voices["main"])
+        if voice_name not in voices:
+            print(f"Voice '{voice_name}' not found, using main.")
+
+        print(f"Generating chunk {idx} with voice '{voice_name}'")
+        audio_segment, sample_rate, spectrogram = infer_process(
+            voice_cfg["ref_audio"],
+            voice_cfg["ref_text"],
+            text,
+            model,
+            vocoder,
+            mel_spec_type=infer_cfg.vocoder_name,
+            target_rms=infer_cfg.target_rms,
+            cross_fade_duration=infer_cfg.cross_fade_duration,
+            nfe_step=infer_cfg.nfe_step,
+            cfg_strength=infer_cfg.cfg_strength,
+            sway_sampling_coef=infer_cfg.sway_sampling_coef,
+            speed=infer_cfg.speed,
+            fix_duration=infer_cfg.fix_duration,
+        )
+
+        if audio_segment is None:
+            continue
+        segments.append(audio_segment)
+        if spectrogram is not None:
+            mel_specs.append(spectrogram)
+
+        if output_chunk_dir is not None:
+            safe_name = re.sub(r"[^\w\-]+", "_", text[:80]).strip("_") or f"chunk_{idx}"
+            sf.write(output_chunk_dir / f"{idx:03d}_{safe_name}.wav", audio_segment, sample_rate)
+
+    return segments, mel_specs, sample_rate if segments else 24000
+
+
+def _concat_segments_with_crossfade(audio_segments: list[np.ndarray], sample_rate: int, cross_fade_duration: float) -> np.ndarray:
+    if not audio_segments:
+        return np.array([], dtype=np.float32)
+    if len(audio_segments) == 1:
+        return np.asarray(audio_segments[0], dtype=np.float32)
+
+    output = np.asarray(audio_segments[0], dtype=np.float32)
+    overlap = max(0, int(sample_rate * max(0.0, cross_fade_duration)))
+    for segment in audio_segments[1:]:
+        segment = np.asarray(segment, dtype=np.float32)
+        current_overlap = min(overlap, len(output), len(segment))
+        if current_overlap <= 0:
+            output = np.concatenate([output, segment])
+            continue
+        fade_out = np.linspace(1.0, 0.0, current_overlap, dtype=np.float32)
+        fade_in = np.linspace(0.0, 1.0, current_overlap, dtype=np.float32)
+        mixed = output[-current_overlap:] * fade_out + segment[:current_overlap] * fade_in
+        output = np.concatenate([output[:-current_overlap], mixed, segment[current_overlap:]])
+    return output
+
+
+def save_outputs(app_cfg, audio_segments: list[np.ndarray], mel_specs: list[np.ndarray], sample_rate: int):
+    infer_cfg = app_cfg.infer
+    if not audio_segments:
+        raise RuntimeError("Inference returned no audio segments.")
+
+    output_dir = Path(infer_cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    final_wave = _concat_segments_with_crossfade(audio_segments, sample_rate, infer_cfg.cross_fade_duration)
+    wave_path = output_dir / infer_cfg.output_file
+    sf.write(wave_path, final_wave, sample_rate)
+
+    mel_path = None
+    if mel_specs:
+        try:
+            mel_path = output_dir / f"{wave_path.stem}_mel.npy"
+            np.save(mel_path, np.concatenate(mel_specs, axis=1))
+        except Exception:
+            mel_path = output_dir / f"{wave_path.stem}_mel_list.npy"
+            np.save(mel_path, np.array(mel_specs, dtype=object), allow_pickle=True)
+
+    if infer_cfg.remove_silence:
+        remove_silence_for_generated_wav(str(wave_path))
+
+    return wave_path, mel_path
 
 
 def main():
-    main_voice = {"ref_audio": ref_audio, "ref_text": ref_text}
-    if "voices" not in config:
-        voices = {"main": main_voice}
-    else:
-        voices = config["voices"]
-        voices["main"] = main_voice
-    for voice in voices:
-        print("Voice:", voice)
-        print("ref_audio ", voices[voice]["ref_audio"])
-        voices[voice]["ref_audio"], voices[voice]["ref_text"] = preprocess_ref_audio_text(
-            voices[voice]["ref_audio"], voices[voice]["ref_text"]
-        )
-        print("ref_audio_", voices[voice]["ref_audio"], "\n\n")
+    args = build_argparser().parse_args()
+    cfg = build_infer_app_config_from_args(args)
+    validate_infer_config(cfg)
 
-    generated_audio_segments = []
-    reg1 = r"(?=\[\w+\])"
-    chunks = re.split(reg1, gen_text)
-    reg2 = r"\[(\w+)\]"
-    for text in chunks:
-        if not text.strip():
-            continue
-        match = re.match(reg2, text)
-        if match:
-            voice = match[1]
-        else:
-            print("No voice tag found, using main.")
-            voice = "main"
-        if voice not in voices:
-            print(f"Voice {voice} not found, using main.")
-            voice = "main"
-        text = re.sub(reg2, "", text)
-        ref_audio_ = voices[voice]["ref_audio"]
-        ref_text_ = voices[voice]["ref_text"]
-        gen_text_ = text.strip()
-        print(f"Voice: {voice}")
-        audio_segment, final_sample_rate, spectragram = infer_process(
-            ref_audio_,
-            ref_text_,
-            gen_text_,
-            ema_model,
-            vocoder,
-            mel_spec_type=vocoder_name,
-            target_rms=target_rms,
-            cross_fade_duration=cross_fade_duration,
-            nfe_step=nfe_step,
-            cfg_strength=cfg_strength,
-            sway_sampling_coef=sway_sampling_coef,
-            speed=speed,
-            fix_duration=fix_duration,
-        )
+    infer_cfg = cfg.infer
+    print_infer_summary(cfg)
 
-        # 모델이 생성한 mel spectrogram 저장
-        np.save("generated_mel.npy", spectragram)
+    vocoder = load_vocoder(
+        vocoder_name=infer_cfg.vocoder_name,
+        is_local=infer_cfg.load_vocoder_from_local,
+        local_path=default_vocoder_local_path(infer_cfg.vocoder_name),
+    )
+    model = load_model(
+        resolve_model_cls(cfg.model.backbone),
+        cfg.model.to_transformer_kwargs(),
+        infer_cfg.ckpt_file,
+        mel_spec_type=infer_cfg.vocoder_name,
+        vocab_file=infer_cfg.vocab_file,
+    )
 
+    voices = build_voices(cfg)
+    segments, mel_specs, sample_rate = infer_segments(cfg, voices, model, vocoder)
+    wave_path, mel_path = save_outputs(cfg, segments, mel_specs, sample_rate)
 
-        generated_audio_segments.append(audio_segment)
-
-        if save_chunk:
-            if len(gen_text_) > 200:
-                gen_text_ = gen_text_[:200] + " ... "
-            sf.write(
-                os.path.join(output_chunk_dir, f"{len(generated_audio_segments)-1}_{gen_text_}.wav"),
-                audio_segment,
-                final_sample_rate,
-            )
-
-    if generated_audio_segments:
-        final_wave = np.concatenate(generated_audio_segments)
-
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        with open(wave_path, "wb") as f:
-            sf.write(f.name, final_wave, final_sample_rate)
-            # Remove silence
-            if remove_silence:
-                remove_silence_for_generated_wav(f.name)
-            print(f.name)
+    print(f"Saved wav: {wave_path}")
+    if mel_path is not None:
+        print(f"Saved mel: {mel_path}")
 
 
 if __name__ == "__main__":

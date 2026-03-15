@@ -18,8 +18,9 @@ from f5_tts.model.utils import convert_char_to_pinyin_orig
 
 # Korean Single Speaker (KSS Dataset)
 # download from : https://www.kaggle.com/datasets/bryanpark/korean-single-speaker-speech-dataset
-PRETRAINED_VOCAB_PATH = Path("/kaggle/working/peft_finetune/vocab.txt")
-NEW_VOCAB_PATH = Path("/workspace/PEFT-TTS/data/vocab_ko.txt")
+_PROJECT_ROOT = Path(str(files("f5_tts").joinpath("../../")))
+PRETRAINED_VOCAB_PATH = _PROJECT_ROOT / "data" / "Emilia_ZH_EN_pinyin" / "vocab.txt"
+NEW_VOCAB_PATH = _PROJECT_ROOT / "data" / "vocab_ko.txt"
 
 
 def is_csv_wavs_format(input_dataset_dir):
@@ -66,15 +67,15 @@ def prepare_csv_wavs_dir(input_dir):
 
     sub_result, durations, vocab_set = [], [], set()
     polyphone = True
-    for audio_path, text in audio_path_text_pairs:
+    for audio_path, text, speaker in audio_path_text_pairs:
         if not Path(audio_path).exists():
             print(f"Audio {audio_path} not found, skipping.")
             continue
         audio_duration = get_audio_duration(audio_path)
 
         text = convert_char_to_pinyin_orig([text], polyphone=polyphone)[0]
-        print("".join(text))
-        sub_result.append({"audio_path": audio_path, "text": text, "duration": audio_duration})
+        #print("".join(text))
+        sub_result.append({"audio_path": audio_path, "text": text, "duration": audio_duration, "speaker": speaker})
         durations.append(audio_duration)
         vocab_set.update(list(text))# updating vocab
 
@@ -95,8 +96,9 @@ def read_audio_text_pairs(csv_file_path):
             if len(row) >= 2:
                 audio_file = row[0].strip()
                 text = row[1].strip()
+                speaker = row[2].strip()
                 audio_file_path = parent / audio_file
-                audio_text_pairs.append((audio_file_path.as_posix(), text))
+                audio_text_pairs.append((audio_file_path.as_posix(), text, speaker))
     return audio_text_pairs
 
 def save_prepped_dataset(out_dir, result, duration_list, text_vocab_set, is_finetune, add_vocab):
@@ -181,16 +183,16 @@ def prepare_and_save_set(inp_dir, out_dir, lst_dir, is_finetune=True, add_vocab 
     save_prepped_dataset(out_dir, train_samples, train_durations, vocab_set, is_finetune, add_vocab)
 
 def cli():
-    input_path = "/workspace/PEFT-TTS/KSS"
-    output_path = "/workspace/PEFT-TTS/data/KSS_pinyin"
-    lst_path = "/workspace/PEFT-TTS/data"
-    print(input_path)
-    print(output_path)
-    print(lst_path)
+    default_input = str(_PROJECT_ROOT / "KSS")
+    default_output = str(_PROJECT_ROOT / "data" / "KSS_pinyin")
+    default_lst = str(_PROJECT_ROOT / "data")
+    print(default_input)
+    print(default_output)
+    print(default_lst)
     parser = argparse.ArgumentParser(description="Prepare and save dataset.")
-    parser.add_argument("--inp_dir", type=str, default = input_path, help="Input directory containing the data.")
-    parser.add_argument("--out_dir", type=str, default = output_path, help="Output directory to save the prepared data.")
-    parser.add_argument("--lst_dir", type=str, default = lst_path, help =".lst directory to save the test_meta.lst")
+    parser.add_argument("--inp_dir", type=str, default=default_input, help="Input directory containing the data.")
+    parser.add_argument("--out_dir", type=str, default=default_output, help="Output directory to save the prepared data.")
+    parser.add_argument("--lst_dir", type=str, default=default_lst, help=".lst directory to save the test_meta.lst")
     parser.add_argument("--pretrain", action="store_true", help="Enable for new pretrain, otherwise is a fine-tune")
     parser.add_argument("--add_vocab", type=bool, default =None, help= "Add new vocabs of your own datasets not found in pre-trained vocab.txt.")
     parser.add_argument("--test_count", type=int, default= 200, help= "Amount of samples you want to split for you test set")
