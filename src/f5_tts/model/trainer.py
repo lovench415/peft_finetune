@@ -68,7 +68,6 @@ class Trainer:
         mel_spec_type: str = "vocos",  # "vocos" | "bigvgan"
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
-        prosody_loss_weight: float = 0.0,
         cfg_dict: dict = None,  # training config
         app_config=None,
         checkpoint_metadata_extra: dict | None = None,
@@ -211,7 +210,6 @@ class Trainer:
         self.local_vocoder_path = local_vocoder_path
 
         self.noise_scheduler = noise_scheduler
-        self.prosody_loss_weight = prosody_loss_weight
         self.app_config = app_config
         self.checkpoint_metadata_extra = checkpoint_metadata_extra or {}
 
@@ -311,12 +309,6 @@ class Trainer:
 
             for name, param in self.model.named_parameters():
                 if 'attn_norm.linear' in name and 'transformer_blocks' in name:
-                    param.requires_grad = True
-
-            # Prosody improvement: unfreeze final modulation layer
-            # norm_out.linear controls scale+shift of final output → directly affects energy contour
-            for name, param in self.model.named_parameters():
-                if 'norm_out.linear' in name:
                     param.requires_grad = True
 
     def load_checkpoint(self):
@@ -530,12 +522,6 @@ class Trainer:
 
         # Load checkpoint (may replace optimizer)
         start_update = self.load_checkpoint()
-
-        # Apply prosody loss weight to model
-        if self.prosody_loss_weight > 0:
-            self.accelerator.unwrap_model(self.model).prosody_loss_weight = self.prosody_loss_weight
-            if self.is_main:
-                print(f"Prosody-aware loss enabled: weight={self.prosody_loss_weight}")
 
         # Create scheduler AFTER load_checkpoint so it binds to the final optimizer
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)

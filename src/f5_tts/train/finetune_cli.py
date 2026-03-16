@@ -62,8 +62,6 @@ def parse_args():
     parser.add_argument("--logger", type=str, default=None, choices=["wandb", "tensorboard"])
     parser.add_argument("--bnb_optimizer", action="store_true")
     parser.add_argument("-vv", "--view_training_procedure2", action="store_true")
-    parser.add_argument("--prosody_loss_weight", type=float, default=0.3,
-                        help="Weight for prosody-aware loss (0=disabled, 0.3=recommended)")
     return parser.parse_args()
 
 

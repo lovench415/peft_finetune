@@ -56,7 +56,6 @@ def trainer_kwargs_from_config(app_cfg, checkpoint_path: str, mel_spec_type: str
         "last_per_updates": train_cfg.last_per_updates,
         "bnb_optimizer": train_cfg.bnb_optimizer,
         "mel_spec_type": mel_spec_type,
-        "prosody_loss_weight": train_cfg.prosody_loss_weight,
         "app_config": app_cfg,
         "checkpoint_metadata_extra": metadata_extra_from_train_config(app_cfg, mel_spec_type),
     }

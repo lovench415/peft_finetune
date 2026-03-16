@@ -32,7 +32,7 @@ from f5_tts.model.modules import (
 # BUG-12 FIX: removed dead TextEmbedding_orig class
 
 class TextEmbedding(nn.Module):
-    def __init__(self, text_num_embeds, text_dim, mask_padding=True, conv_layers=0, conv_mult=2, conv_dilations=None, tuning_config=None, ko=True):
+    def __init__(self, text_num_embeds, text_dim, mask_padding=True, conv_layers=0, conv_mult=2, tuning_config=None, ko=True):
         super().__init__()
         self.tuning_config = tuning_config
         self.mask_padding = mask_padding
@@ -57,18 +57,8 @@ class TextEmbedding(nn.Module):
             self.precompute_max_pos = 4096  # ~44s of 24khz audio
             self.register_buffer("freqs_cis", precompute_freqs_cis(text_dim, self.precompute_max_pos), persistent=False)
 
-            # Prosody improvement: multi-scale dilations for larger receptive field
-            # Default [1,1,2,4] with kernel=7 → effective RF ~73 tokens (phrase-level prosody)
-            # Pretrained F5-TTS uses dilation=1 for all — weights still load (dilation doesn't change shape)
-            if conv_dilations is None:
-                conv_dilations = [1] * conv_layers  # backward-compatible default
-            assert len(conv_dilations) == conv_layers, (
-                f"conv_dilations length ({len(conv_dilations)}) must match conv_layers ({conv_layers})"
-            )
-
             self.text_blocks = nn.Sequential(
-                *[ConvNeXtV2Block(text_dim, text_dim * conv_mult, dilation=d, tuning_config=tuning_config)
-                  for d in conv_dilations]
+                *[ConvNeXtV2Block(text_dim, text_dim * conv_mult, tuning_config=tuning_config) for _ in range(conv_layers)]
             )
         else:
             self.extra_modeling = False
@@ -199,7 +189,6 @@ class DiT(nn.Module):
         text_mask_padding=True,
         qk_norm=None,
         conv_layers=0,
-        conv_dilations=None,
         pe_attn_head=None,
         long_skip_connection=False,
         checkpoint_activations=False,
@@ -213,7 +202,7 @@ class DiT(nn.Module):
         if text_dim is None:
             text_dim = mel_dim
 
-        self.text_embed = TextEmbedding(text_num_embeds, text_dim, mask_padding=text_mask_padding, conv_layers=conv_layers, conv_dilations=conv_dilations, tuning_config=conditioning_adapter_config, ko=ko)
+        self.text_embed = TextEmbedding(text_num_embeds, text_dim, mask_padding=text_mask_padding, conv_layers=conv_layers, tuning_config=conditioning_adapter_config, ko=ko)
         self.text_cond, self.text_uncond = None, None
         self.input_embed = InputEmbedding(mel_dim, text_dim, dim, tuning_config=prompt_adapter_config)
 

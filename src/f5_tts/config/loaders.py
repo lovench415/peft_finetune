@@ -69,8 +69,7 @@ def build_model_config(model_name: str, explicit_model_cfg: str | None = None) -
         )
 
     if model_name == "F5TTS_v1_Base":
-        base_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4,
-                        conv_dilations=[1, 1, 2, 4])  # multi-scale for prosody
+        base_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)
         model_cfg, adapter_components, trainable_map = get_model_cfg(base_cfg)
         return ModelConfig(
             name=model_name,
@@ -91,7 +90,6 @@ def build_model_config(model_name: str, explicit_model_cfg: str | None = None) -
             text_dim=512,
             text_mask_padding=False,
             conv_layers=4,
-            conv_dilations=[1, 1, 2, 4],  # multi-scale for prosody
             pe_attn_head=1,
         )
         model_cfg, adapter_components, trainable_map = get_model_cfg(base_cfg)
@@ -107,8 +105,7 @@ def build_model_config(model_name: str, explicit_model_cfg: str | None = None) -
         )
 
     if model_name == "PEFT-TTS_v1":
-        base_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4,
-                        conv_dilations=[1, 1, 2, 4])  # multi-scale for prosody
+        base_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)
         model_cfg, adapter_components, trainable_map = get_model_cfg(base_cfg)
         return ModelConfig(
             name=model_name,
@@ -206,7 +203,6 @@ def build_train_app_config_from_args(args) -> AppConfig:
         logger=args.logger,
         bnb_optimizer=args.bnb_optimizer,
         view_training_procedure=args.view_training_procedure2,
-        prosody_loss_weight=args.prosody_loss_weight,
     )
     return AppConfig(model=model_cfg, batching=batching, train=train)
 

@@ -350,19 +350,15 @@ class ConvNeXtV2Block(nn.Module):
 
         if self.tuning_config and 'conv_adapt' in self.tuning_config.method:
             # BUG-3 FIX: multiply by adapt_size to compress (not divide)
-            adapter_width = max(1, int(dim * self.tuning_config.adapt_size))
-            # BUG-43 FIX: padding must match ConvAdapter's own dilation (1),
-            # NOT the outer block's dilation. Using outer dilation causes
-            # output length != input length → size mismatch crash.
-            adapter_kernel = int(self.tuning_config.kernel_size)
-            adapter_padding = (adapter_kernel - 1) // 2  # same-padding for stride=1, dilation=1
+            # adapt_size=0.25 → width = dim * 0.25 = 128 (compression to 25%)
+            adapter_width = max(1, int(dim // self.tuning_config.adapt_size))
             self.conv_adapter = ConvAdapter(
                 dim, dim,
-                kernel_size=adapter_kernel,
-                padding=adapter_padding,
+                kernel_size=int(self.tuning_config.kernel_size),
+                padding=int(dilation * (self.tuning_config.kernel_size - 1) // 2),
                 width=adapter_width,
                 stride=1,
-                groups=1,
+                groups=1,  # BUG-4 FIX: use groups=1 for standard conv (depthwise requires width==inplanes)
                 dilation=1,
                 act_layer=nn.GELU
             )

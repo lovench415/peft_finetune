@@ -42,7 +42,6 @@ class CFM(nn.Module):
         mel_spec_kwargs: dict = None,
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
         vocab_char_map: dict[str:int] | None = None,
-        prosody_loss_weight: float = 0.0,
     ):
         super().__init__()
         if odeint_kwargs is None:
@@ -51,7 +50,6 @@ class CFM(nn.Module):
             mel_spec_kwargs = {}
 
         self.frac_lengths_mask = frac_lengths_mask
-        self.prosody_loss_weight = prosody_loss_weight
 
         # mel spec
         self.mel_spec = default(mel_spec_module, MelSpec(**mel_spec_kwargs))
@@ -287,23 +285,6 @@ class CFM(nn.Module):
 
         # flow matching loss
         loss = F.mse_loss(pred, flow, reduction="none")
-
-        # Prosody-aware loss weighting: emphasize frames with energy transitions
-        # Frames at phrase boundaries, attacks, and pauses get higher weight
-        if self.prosody_loss_weight > 0:
-            with torch.no_grad():
-                # Frame energy from target mel
-                energy = x1.pow(2).mean(-1)  # (b, n)
-                # Temporal energy delta → marks prosodic transitions
-                delta = torch.abs(energy[:, 1:] - energy[:, :-1])
-                delta = F.pad(delta, (1, 0), value=0.0)  # (b, n) — align with frames
-                # Normalize per-utterance to [1, 1 + prosody_loss_weight]
-                delta_max = delta.amax(dim=-1, keepdim=True).clamp(min=1e-8)
-                weights = 1.0 + self.prosody_loss_weight * (delta / delta_max)
-                # Expand to mel channels and apply mask
-                weights = weights.unsqueeze(-1).expand_as(loss)  # (b, n, d)
-
-            loss = loss * weights
-
         loss = loss[rand_span_mask]
+
         return loss.mean(), cond, pred

@@ -89,7 +89,6 @@ class TrainConfig:
     logger: str | None = None
     bnb_optimizer: bool = False
     view_training_procedure: bool = False
-    prosody_loss_weight: float = 0.0
 
 
 @dataclass
