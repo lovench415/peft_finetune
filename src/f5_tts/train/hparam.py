@@ -19,7 +19,8 @@ prompt_adapter_config = LoraConfig(r=prompt_rank, lora_alpha = 2 * prompt_rank, 
 
 
 # DiT LoRA Adapter
-dit_lora_adapter_config = LoraConfig(r=dit_rank, lora_alpha =2 * dit_rank, target_modules = ["to_q","to_k", "to_v"], scale=1.0)#, lora_adapter_name="randlora") # lora
+# PROSODY: "ff" adds LoRA on FeedForward output (per-position prosody shaping)
+dit_lora_adapter_config = LoraConfig(r=dit_rank, lora_alpha =2 * dit_rank, target_modules = ["to_q","to_k", "to_v", "ff"], scale=1.0)
 
 
 def is_adapter(config):

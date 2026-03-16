@@ -301,14 +301,23 @@ class Trainer:
             # Always freeze pretrained embedding
             self.model.transformer.text_embed.text_embed.weight.requires_grad = False
             # BUG-34 FIX: only freeze text_embed_ko when it's not the active embedding
-            # alpha=1 means ko=True → text_embed_ko is active → should be trainable
             if self.model.transformer.text_embed.alpha == 1:
                 self.model.transformer.text_embed.text_embed_ko.weight.requires_grad = True
             else:
                 self.model.transformer.text_embed.text_embed_ko.weight.requires_grad = False
 
             for name, param in self.model.named_parameters():
+                # AdaLayerNorm gates — modulate each block via timestep
                 if 'attn_norm.linear' in name and 'transformer_blocks' in name:
+                    param.requires_grad = True
+                # PROSODY: ConvPositionEmbedding — local temporal patterns (rhythm, tempo)
+                if 'conv_pos_embed' in name:
+                    param.requires_grad = True
+                # PROSODY: TimestepEmbedding MLP — global conditioning for all blocks
+                if 'time_embed' in name:
+                    param.requires_grad = True
+                # PROSODY: FeedForward LoRA — per-position nonlinear transforms
+                if 'ff_lora' in name:
                     param.requires_grad = True
 
     def load_checkpoint(self):
@@ -377,7 +386,14 @@ class Trainer:
                     del checkpoint["model_state_dict"][key]
 
             if self.adapter_config:
-                self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"], strict=True)
+                # strict=False: allows resume from older checkpoints missing new adapter keys (e.g. ff_lora)
+                # New adapter params (ff_lora) will be initialized from scratch (zero-init → no-op at start)
+                load_result = self.accelerator.unwrap_model(self.model).load_state_dict(
+                    checkpoint["model_state_dict"], strict=False
+                )
+                if load_result.missing_keys and self.is_main:
+                    print(f"Resume: {len(load_result.missing_keys)} new params initialized fresh: "
+                          f"{load_result.missing_keys[:5]}{'...' if len(load_result.missing_keys) > 5 else ''}")
                 self.set_trainable_parameters()
                 trainable_params = [param for param in self.model.parameters() if param.requires_grad]
                 self.optimizer = AdamW(trainable_params, lr=self.learning_rate)

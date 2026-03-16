@@ -349,16 +349,16 @@ class ConvNeXtV2Block(nn.Module):
         self.tuning_config = tuning_config
 
         if self.tuning_config and 'conv_adapt' in self.tuning_config.method:
-            # BUG-3 FIX: multiply by adapt_size to compress (not divide)
-            # adapt_size=0.25 → width = dim * 0.25 = 128 (compression to 25%)
-            adapter_width = max(1, int(dim // self.tuning_config.adapt_size))
+            adapter_width = max(1, int(dim * self.tuning_config.adapt_size))
+            adapter_kernel = int(self.tuning_config.kernel_size)
+            adapter_padding = (adapter_kernel - 1) // 2  # same-padding for dilation=1
             self.conv_adapter = ConvAdapter(
                 dim, dim,
-                kernel_size=int(self.tuning_config.kernel_size),
-                padding=int(dilation * (self.tuning_config.kernel_size - 1) // 2),
+                kernel_size=adapter_kernel,
+                padding=adapter_padding,
                 width=adapter_width,
                 stride=1,
-                groups=1,  # BUG-4 FIX: use groups=1 for standard conv (depthwise requires width==inplanes)
+                groups=1,
                 dilation=1,
                 act_layer=nn.GELU
             )
@@ -928,7 +928,7 @@ class JointAttnProcessor:
 # DiT Block
 
 class DiTBlock(nn.Module):
-    def __init__(self, dim, heads, dim_head, ff_mult=4, dropout=0.1, qk_norm=None, pe_attn_head=None, tuning_config= None):
+    def __init__(self, dim, heads, dim_head, ff_mult=4, dropout=0.1, qk_norm=None, pe_attn_head=None, tuning_config=None):
         super().__init__()
 
         self.attn_norm = AdaLayerNorm(dim)
@@ -939,11 +939,17 @@ class DiTBlock(nn.Module):
             dim_head=dim_head,
             dropout=dropout,
             qk_norm=qk_norm,
-            tuning_config= tuning_config,
+            tuning_config=tuning_config,
         )
 
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
+
+        # PROSODY: LoRA adapter on FeedForward output
+        # FFN controls per-position nonlinear transforms → directly shapes prosody contours
+        self.ff_lora = None
+        if tuning_config and "ff" in getattr(tuning_config, 'target_modules', []):
+            self.ff_lora = LoraLayer(dim, dim, r=tuning_config.r, alpha=tuning_config.lora_alpha)
 
     def forward(self, x, t, mask=None, rope=None):  # x: noised input, t: time embedding
         # pre-norm & modulation for attention input
@@ -957,6 +963,11 @@ class DiTBlock(nn.Module):
 
         norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         ff_output = self.ff(norm)
+
+        # PROSODY: add LoRA residual to FFN output
+        if self.ff_lora is not None:
+            ff_output = ff_output + self.ff_lora(norm)
+
         x = x + gate_mlp.unsqueeze(1) * ff_output
 
         return x

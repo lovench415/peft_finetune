@@ -61,6 +61,9 @@ def parse_args():
     parser.add_argument("--log_samples", action="store_true")
     parser.add_argument("--logger", type=str, default=None, choices=["wandb", "tensorboard"])
     parser.add_argument("--bnb_optimizer", action="store_true")
+    parser.add_argument("--prosody_loss_weight", type=float, default=0.0,
+                        help="Prosody mel-band loss weight (0=off, 0.5=recommended). "
+                             "Emphasizes F0/energy channels in flow matching loss.")
     parser.add_argument("-vv", "--view_training_procedure2", action="store_true")
     return parser.parse_args()
 
@@ -118,6 +121,7 @@ def main():
         transformer=model_cls(**model_cfg.to_transformer_kwargs(), text_num_embeds=vocab_size, mel_dim=n_mel_channels),
         mel_spec_kwargs=mel_spec_kwargs,
         vocab_char_map=vocab_char_map,
+        prosody_loss_weight=args.prosody_loss_weight,
     )
 
     trainer = Trainer(

@@ -42,6 +42,7 @@ class CFM(nn.Module):
         mel_spec_kwargs: dict = None,
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
         vocab_char_map: dict[str:int] | None = None,
+        prosody_loss_weight: float = 0.0,
     ):
         super().__init__()
         if odeint_kwargs is None:
@@ -73,6 +74,14 @@ class CFM(nn.Module):
 
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
+
+        # PROSODY: mel-band weighted loss — emphasize F0 and energy regions
+        self.prosody_loss_weight = prosody_loss_weight
+        if prosody_loss_weight > 0:
+            w = torch.ones(1, 1, num_channels)
+            w[:, :, :20] = 1.0 + prosody_loss_weight        # channels 0-19: F0 region (~0-1kHz)
+            w[:, :, 20:40] = 1.0 + prosody_loss_weight * 0.5  # channels 20-39: formant region
+            self.register_buffer("prosody_weight", w)
 
     @property
     def device(self):
@@ -285,6 +294,11 @@ class CFM(nn.Module):
 
         # flow matching loss
         loss = F.mse_loss(pred, flow, reduction="none")
+
+        # PROSODY: weight lower mel bands (F0, energy) more heavily
+        if self.prosody_loss_weight > 0:
+            loss = loss * self.prosody_weight
+
         loss = loss[rand_span_mask]
 
         return loss.mean(), cond, pred
