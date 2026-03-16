@@ -67,7 +67,7 @@ def prepare_csv_wavs_dir(input_dir):
 
     sub_result, durations, vocab_set = [], [], set()
     polyphone = True
-    for audio_path, text in audio_path_text_pairs:
+    for audio_path, text, speak in audio_path_text_pairs:
         if not Path(audio_path).exists():
             print(f"Audio {audio_path} not found, skipping.")
             continue
@@ -75,7 +75,7 @@ def prepare_csv_wavs_dir(input_dir):
 
         text = convert_char_to_pinyin_orig([text], polyphone=polyphone)[0]
         print("".join(text))
-        sub_result.append({"audio_path": audio_path, "text": text, "duration": audio_duration})
+        sub_result.append({"audio_path": audio_path, "text": text, "duration": audio_duration, "speaker": speak})
         durations.append(audio_duration)
         vocab_set.update(list(text))# updating vocab
 
