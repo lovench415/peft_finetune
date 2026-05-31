@@ -299,12 +299,15 @@ class Trainer:
                                 param.requires_grad = True
 
             # Always freeze pretrained embedding
-            self.model.transformer.text_embed.text_embed.weight.requires_grad = False
+            text_embed_module = self.model.transformer.text_embed
+            text_embed_module.text_embed.weight.requires_grad = False
             # BUG-34 FIX: only freeze text_embed_ko when it's not the active embedding
-            if self.model.transformer.text_embed.alpha == 1:
-                self.model.transformer.text_embed.text_embed_ko.weight.requires_grad = True
-            else:
-                self.model.transformer.text_embed.text_embed_ko.weight.requires_grad = False
+            # BUG-55 FIX: guard for backbones without dual ko-embedding (e.g. UNetT/E2TTS)
+            if hasattr(text_embed_module, "text_embed_ko"):
+                if getattr(text_embed_module, "alpha", 0) == 1:
+                    text_embed_module.text_embed_ko.weight.requires_grad = True
+                else:
+                    text_embed_module.text_embed_ko.weight.requires_grad = False
 
             for name, param in self.model.named_parameters():
                 # AdaLayerNorm gates — modulate each block via timestep
@@ -319,6 +322,19 @@ class Trainer:
                 # PROSODY: FeedForward LoRA — per-position nonlinear transforms
                 if 'ff_lora' in name:
                     param.requires_grad = True
+
+            # BUG-56 FIX: sanity check — warn if adapters weren't created (e.g. UNetT/E2TTS
+            # backbone silently dropped the adapter configs via inspect.signature filtering)
+            n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            has_adapters = any(
+                ('conv_adapt' in n) or ('lora_layers' in n) or ('ff_lora' in n)
+                for n, _ in self.model.named_parameters()
+            )
+            if not has_adapters:
+                print("WARNING: adapter_config is set but NO adapter modules found in the model. "
+                      "The selected backbone may not support PEFT adapters (e.g. UNetT/E2TTS). "
+                      "Only AdaLayerNorm/conv_pos_embed/time_embed will train.")
+            print(f"Trainable parameters: {n_trainable:,}")
 
     def load_checkpoint(self):
         if (
